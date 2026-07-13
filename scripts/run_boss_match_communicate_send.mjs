@@ -218,7 +218,7 @@ JSON.stringify((() => {
       city: textOf(locationEl),
       text: textOf(card),
     };
-  }).slice(0, 30);
+  }).slice(-100);
   const buttons = Array.from(detailRoot.querySelectorAll('a, button')).map((el, index) => ({
     index,
     text: textOf(el),
@@ -284,6 +284,64 @@ new Promise((resolve) => {
         locations,
         jobCount: document.querySelectorAll('.job-card-wrap').length,
       },
+    }));
+  }, 2500);
+})
+`);
+}
+
+async function scrollJobList(ws) {
+  return await evalJson(ws, String.raw`
+new Promise((resolve) => {
+  const cardsBefore = Array.from(document.querySelectorAll('.job-card-wrap'));
+  const hrefsBefore = cardsBefore.map((card) => card.querySelector('a.job-name')?.href || '').filter(Boolean);
+  const lastCard = cardsBefore.at(-1);
+  const configuredList = document.querySelector('.job-list-container');
+  const findScrollableAncestor = (element) => {
+    let current = element;
+    while (current && current !== document.body) {
+      const style = getComputedStyle(current);
+      if (/(auto|scroll)/.test(style.overflowY) && current.scrollHeight > current.clientHeight + 4) {
+        return current;
+      }
+      current = current.parentElement;
+    }
+    return null;
+  };
+  const scroller =
+    findScrollableAncestor(lastCard) ||
+    findScrollableAncestor(configuredList) ||
+    configuredList ||
+    document.scrollingElement;
+  const before = {
+    cardCount: cardsBefore.length,
+    scrollTop: scroller?.scrollTop ?? window.scrollY,
+    scrollHeight: scroller?.scrollHeight ?? document.documentElement.scrollHeight,
+    clientHeight: scroller?.clientHeight ?? window.innerHeight,
+  };
+
+  lastCard?.scrollIntoView({ block: 'end' });
+  if (scroller === document.scrollingElement || scroller === document.documentElement || scroller === document.body) {
+    window.scrollTo(0, document.documentElement.scrollHeight);
+  } else if (scroller) {
+    scroller.scrollTop = scroller.scrollHeight;
+    scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+  }
+
+  setTimeout(() => {
+    const cardsAfter = Array.from(document.querySelectorAll('.job-card-wrap'));
+    const hrefsAfter = cardsAfter.map((card) => card.querySelector('a.job-name')?.href || '').filter(Boolean);
+    const previous = new Set(hrefsBefore);
+    resolve(JSON.stringify({
+      before,
+      after: {
+        cardCount: cardsAfter.length,
+        scrollTop: scroller?.scrollTop ?? window.scrollY,
+        scrollHeight: scroller?.scrollHeight ?? document.documentElement.scrollHeight,
+        clientHeight: scroller?.clientHeight ?? window.innerHeight,
+      },
+      newUrls: hrefsAfter.filter((href) => !previous.has(href)),
+      lastVisibleUrl: hrefsAfter.at(-1) || '',
     }));
   }, 2500);
 })
@@ -652,56 +710,89 @@ async function main() {
     steps.push({ step: "dismiss_existing_greet_dialog", result: await dismissGreetDialog(ws) });
   }
 
-  let stateForSelection = await snapshot(ws);
-  let selection = selectCandidate(stateForSelection.jobs);
-  steps.push({ step: "select_candidates", state: stateForSelection, selection });
-  if (!selection.candidates.length) {
-    await sendCdp(ws, "Page.reload");
-    await new Promise((resolve) => setTimeout(resolve, 2500));
-    stateForSelection = await snapshot(ws);
-    selection = selectCandidate(stateForSelection.jobs);
-    steps.push({ step: "reload_and_select_candidates", state: stateForSelection, selection });
-  }
-  if (!selection.candidates.length) throw new Error("No local-rule candidates found");
-
   let selectedCandidate = null;
   let selectedJob = null;
   let selectedMatch = null;
-  let selectedState = stateForSelection;
+  let selectedState = null;
   const candidateAttempts = [];
-  for (const candidate of selection.candidates) {
-    let afterClick = await snapshot(ws);
-    if (!afterClick.detailTitle.includes(candidate.title) || afterClick.activeCardHref !== candidate.href) {
-      const clickResult = await clickJobName(ws, candidate.index);
-      afterClick = await snapshot(ws);
-      steps.push({ step: "click_candidate_job_name", candidate, result: clickResult, state: afterClick });
-    }
+  const attemptedUrls = new Set();
+  const observedUrls = new Set();
+  const maxScrollRounds = 20;
+  const maxStagnantScrolls = 3;
+  let stagnantScrolls = 0;
+  let stateForSelection = await snapshot(ws);
 
-    const detailMatches = afterClick.detailTitle.includes(candidate.title) && afterClick.activeCardHref === candidate.href;
-    if (!detailMatches) {
-      const attempt = {
-        candidate,
-        detailMatches,
-        reason: `详情岗位未切换到候选岗位：candidate=${candidate.title}, detail=${afterClick.detailTitle}, activeHref=${afterClick.activeCardHref}`,
-      };
+  for (let round = 0; round <= maxScrollRounds && !selectedCandidate; round += 1) {
+    const selection = selectCandidate(stateForSelection.jobs);
+    const visibleUrls = stateForSelection.jobs.map((job) => job.href).filter(Boolean);
+    const newVisibleUrls = visibleUrls.filter((href) => !observedUrls.has(href));
+    visibleUrls.forEach((href) => observedUrls.add(href));
+    const candidates = selection.candidates.filter((candidate) => candidate.href && !attemptedUrls.has(candidate.href));
+    steps.push({
+      step: "select_candidates",
+      round,
+      state: stateForSelection,
+      selection,
+      newVisibleUrlCount: newVisibleUrls.length,
+      unattemptedCandidateCount: candidates.length,
+    });
+
+    for (const candidate of candidates) {
+      attemptedUrls.add(candidate.href);
+      let afterClick = await snapshot(ws);
+      if (!afterClick.detailTitle.includes(candidate.title) || afterClick.activeCardHref !== candidate.href) {
+        const clickResult = await clickJobName(ws, candidate.index);
+        afterClick = await snapshot(ws);
+        steps.push({ step: "click_candidate_job_name", round, candidate, result: clickResult, state: afterClick });
+      }
+
+      const detailMatches = afterClick.detailTitle.includes(candidate.title) && afterClick.activeCardHref === candidate.href;
+      if (!detailMatches) {
+        const attempt = {
+          round,
+          candidate,
+          detailMatches,
+          reason: `详情岗位未切换到候选岗位：candidate=${candidate.title}, detail=${afterClick.detailTitle}, activeHref=${afterClick.activeCardHref}`,
+        };
+        candidateAttempts.push(attempt);
+        steps.push({ step: "candidate_detail_mismatch", attempt });
+        continue;
+      }
+
+      const job = await extractDetailJob(ws, candidate);
+      const match = matchJobWithPython(runId, job);
+      const attempt = { round, candidate, detailMatches, job, match };
       candidateAttempts.push(attempt);
-      steps.push({ step: "candidate_detail_mismatch", attempt });
-      continue;
+      steps.push({ step: "extract_and_match_candidate", attempt });
+      if (match.result.skipped) {
+        continue;
+      }
+      if (match.result.matched) {
+        selectedCandidate = candidate;
+        selectedJob = job;
+        selectedMatch = match;
+        selectedState = afterClick;
+        break;
+      }
     }
 
-    const job = await extractDetailJob(ws, candidate);
-    const match = matchJobWithPython(runId, job);
-    const attempt = { candidate, detailMatches, job, match };
-    candidateAttempts.push(attempt);
-    steps.push({ step: "extract_and_match_candidate", attempt });
-    if (match.result.skipped) {
-      continue;
-    }
-    if (match.result.matched) {
-      selectedCandidate = candidate;
-      selectedJob = job;
-      selectedMatch = match;
-      selectedState = afterClick;
+    if (selectedCandidate || round === maxScrollRounds) break;
+
+    const scrollResult = await scrollJobList(ws);
+    const nextState = await snapshot(ws);
+    const nextUrls = nextState.jobs.map((job) => job.href).filter(Boolean);
+    const discoveredAfterScroll = nextUrls.filter((href) => !observedUrls.has(href));
+    stagnantScrolls = discoveredAfterScroll.length ? 0 : stagnantScrolls + 1;
+    steps.push({
+      step: "scroll_job_list",
+      round,
+      result: scrollResult,
+      discoveredUrlCount: discoveredAfterScroll.length,
+      stagnantScrolls,
+      state: nextState,
+    });
+    stateForSelection = nextState;
+    if (stagnantScrolls >= maxStagnantScrolls) {
       break;
     }
   }
@@ -714,7 +805,7 @@ async function main() {
       beforeTarget,
       afterTarget,
       candidateAttempts,
-      guard: { ok: false, reason: "当前可见本地候选均未通过 AI 匹配" },
+      guard: { ok: false, reason: "滚动加载后仍未找到通过 AI 匹配的新岗位" },
       immediate: { clicked: false, reason: "no_ai_matched_candidate" },
       continueChat: { clicked: false, reason: "no_ai_matched_candidate" },
       sendMessage: { sent: false, reason: "no_ai_matched_candidate" },
@@ -723,7 +814,7 @@ async function main() {
     const logPath = path.join(logDir, `${runId}-match-communicate-send.json`);
     payload.logPath = logPath;
     fs.writeFileSync(logPath, JSON.stringify(payload, null, 2), "utf8");
-    writeDocs(runId, { ...payload, candidate: {}, match: { result: { matched: false, reason: "当前可见本地候选均未通过 AI 匹配", message: "" } } });
+    writeDocs(runId, { ...payload, candidate: {}, match: { result: { matched: false, reason: "滚动加载后仍未找到通过 AI 匹配的新岗位", message: "" } } });
     ws.close();
     console.log(JSON.stringify({
       logPath,
@@ -731,9 +822,11 @@ async function main() {
       matchedCandidate: null,
       attempts: candidateAttempts.map((item) => ({
         index: item.candidate?.index,
+        round: item.round,
         title: item.candidate?.title,
         city: item.candidate?.city,
         minK: item.candidate?.minK,
+        maxK: item.candidate?.maxK,
         matched: item.match?.result?.matched ?? false,
         reason: item.match?.result?.reason || item.reason || "",
       })),
