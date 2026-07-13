@@ -1,4 +1,4 @@
-候选人期望最低薪资：{{expected_salary_min_k}}k
+候选人期望薪资范围：{{expected_salary_min_k}}-{{expected_salary_max_k}}k
 候选人候选城市：{{candidate_cities}}
 候选人描述：
 {{profile_description}}

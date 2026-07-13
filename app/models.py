@@ -7,6 +7,7 @@ from typing import Any
 @dataclass(frozen=True)
 class UserProfile:
     expected_salary_min_k: int
+    expected_salary_max_k: int
     candidate_cities: list[str]
     description: str
 

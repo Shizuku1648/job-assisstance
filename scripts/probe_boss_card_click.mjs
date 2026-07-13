@@ -15,10 +15,10 @@ function decodeBossText(text = "") {
   return Array.from(text).map((char) => digitMap.get(char) || char).join("");
 }
 
-function minSalaryK(text = "") {
+function salaryRangeK(text = "") {
   const decoded = decodeBossText(text);
   const match = decoded.match(/(\d+)\s*-\s*(\d+)\s*K/i);
-  return match ? Number(match[1]) : null;
+  return match ? { minK: Number(match[1]), maxK: Number(match[2]) } : null;
 }
 
 function stamp() {
@@ -132,7 +132,7 @@ async function snapshot(ws) {
 function selectCandidate(jobs) {
   const scored = jobs.map((job) => {
     const decodedText = decodeBossText(job.text);
-    const minK = minSalaryK(job.text);
+    const salaryRange = salaryRangeK(job.text);
     const keywordScore = [
       /AI\s*Agent/i,
       /Agent/i,
@@ -144,10 +144,10 @@ function selectCandidate(jobs) {
       /RAG/i,
       /应用开发/,
     ].reduce((score, regex) => score + (regex.test(decodedText) ? 1 : 0), 0);
-    return { ...job, decodedText, minK, keywordScore };
+    return { ...job, decodedText, minK: salaryRange?.minK ?? null, maxK: salaryRange?.maxK ?? null, keywordScore };
   });
   const candidate = scored
-    .filter((job) => job.city.includes("上海") && job.minK !== null && job.minK >= 20 && job.keywordScore > 0)
+    .filter((job) => job.city.includes("上海") && job.minK !== null && job.maxK !== null && job.keywordScore > 0)
     .sort((a, b) => b.keywordScore - a.keywordScore || a.index - b.index)[0];
   return { scored, candidate };
 }

@@ -1,11 +1,21 @@
-# Test your FastAPI endpoints
+# Read-only smoke tests for the local FastAPI server
 
 GET http://127.0.0.1:8000/
+Accept: text/html
+
+###
+
+GET http://127.0.0.1:8000/api/status
 Accept: application/json
 
 ###
 
-GET http://127.0.0.1:8000/hello/User
+GET http://127.0.0.1:8000/api/contact-quota
+Accept: application/json
+
+###
+
+GET http://127.0.0.1:8000/api/profile
 Accept: application/json
 
 ###

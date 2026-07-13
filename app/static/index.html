@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Job Assistance 控制台</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>Job Assistance 控制台</h1>
+      <p>Boss 直聘自动化求职，Edge CDP 实战调试模式</p>
+    </div>
+    <a id="repoLink" class="repo-link" href="https://github.com/Shizuku1648/job-assisstance" target="_blank" rel="noreferrer">GitHub</a>
+  </header>
+
+  <main class="layout">
+    <aside class="column">
+      <section class="panel">
+        <div class="panel-head">
+          <h2>用户配置</h2>
+          <span id="profileState" class="pill">未加载</span>
+        </div>
+        <div class="panel-body stack">
+          <div class="fields-2">
+            <label>
+              <span>期望薪资下限 k</span>
+              <input id="salaryMin" type="number" min="1" value="20">
+            </label>
+            <label>
+              <span>期望薪资上限 k</span>
+              <input id="salaryMax" type="number" min="1" value="25">
+            </label>
+          </div>
+          <label>
+            <span>候选城市</span>
+            <input id="cities" placeholder="上海">
+          </label>
+          <label>
+            <span>个人描述</span>
+            <textarea id="description"></textarea>
+          </label>
+          <div class="actions">
+            <button class="primary" type="button" data-action="save-profile">保存配置</button>
+            <button type="button" data-action="load-profile">重新加载</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>浏览器登录</h2>
+          <span class="pill warning">Edge CDP</span>
+        </div>
+        <div class="panel-body stack">
+          <div class="actions">
+            <button class="primary" type="button" data-action="open-login">打开登录页</button>
+            <button type="button" data-action="save-auth">保存登录状态</button>
+          </div>
+          <p class="note">验证码和安全验证只由用户手动处理。页面关闭或回到 Boss 首页会被判定为风控信号。</p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>消息模板</h2>
+          <span class="pill success">固定 + AI</span>
+        </div>
+        <div class="panel-body">
+          <pre id="messagePreview" class="message-preview"></pre>
+        </div>
+      </section>
+    </aside>
+
+    <section class="workspace">
+      <section class="panel">
+        <div class="panel-head">
+          <h2>运行控制</h2>
+          <span id="runPill" class="pill">idle</span>
+        </div>
+        <div class="panel-body stack">
+          <div class="metrics">
+            <div class="metric">
+              <span>运行状态</span>
+              <strong id="runningMetric">-</strong>
+            </div>
+            <div class="metric">
+              <span>当前阶段</span>
+              <strong id="phaseMetric">-</strong>
+            </div>
+            <div class="metric">
+              <span>今日已沟通</span>
+              <strong id="contactedMetric">0 / 150</strong>
+            </div>
+            <div class="metric">
+              <span>今日剩余</span>
+              <strong id="remainingMetric">150</strong>
+            </div>
+          </div>
+          <div class="run-config">
+            <label>
+              <span>本次沟通数量</span>
+              <input id="runCount" type="number" min="1" max="150" value="5">
+            </label>
+            <button id="runButton" class="success" type="button" data-action="run">开始运行</button>
+          </div>
+          <div class="actions">
+            <button type="button" data-action="explore">探索推荐页</button>
+            <button class="danger" type="button" data-action="stop">停止</button>
+            <button type="button" data-action="refresh">刷新</button>
+          </div>
+          <pre id="statusBox" class="status-box">{}</pre>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>岗位记录</h2>
+          <button type="button" data-action="load-jobs">刷新</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>岗位</th>
+                <th>城市/薪资</th>
+                <th>状态</th>
+                <th>AI</th>
+              </tr>
+            </thead>
+            <tbody id="jobsBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+
+    <aside class="column">
+      <section class="panel">
+        <div class="panel-head">
+          <h2>最近日志</h2>
+          <button type="button" data-action="load-logs">刷新</button>
+        </div>
+        <div class="table-wrap logs">
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>事件</th>
+                <th>结果</th>
+              </tr>
+            </thead>
+            <tbody id="logsBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </aside>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

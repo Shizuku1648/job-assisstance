@@ -10,7 +10,7 @@ from app.ai_service import AIService
 from app.config import get_settings
 from app.database import Database
 from app.models import JobSnapshot
-from app.salary import salary_min_k
+from app.salary import salary_range_k, salary_ranges_overlap
 
 
 def main() -> None:
@@ -22,9 +22,14 @@ def main() -> None:
         raise SystemExit("No jobs found")
 
     row = jobs[0]
-    min_k = salary_min_k(row["salary"])
+    salary_range = salary_range_k(row["salary"])
+    min_k, max_k = salary_range if salary_range else (None, None)
     city_ok = any(city in row["city"] for city in profile.candidate_cities)
-    salary_ok = min_k is not None and min_k >= profile.expected_salary_min_k
+    salary_ok = salary_ranges_overlap(
+        row["salary"],
+        profile.expected_salary_min_k,
+        profile.expected_salary_max_k,
+    )
     job = JobSnapshot(
         title=row["title"],
         company=row["company"],
@@ -38,7 +43,12 @@ def main() -> None:
         result = {
             "job_id": row["id"],
             "matched": False,
-            "reason": f"规则过滤未通过：city_ok={city_ok}, salary_ok={salary_ok}, min_k={min_k}",
+            "reason": (
+                "规则过滤未通过："
+                f"city_ok={city_ok}, salary_ok={salary_ok}, "
+                f"job_salary={min_k}-{max_k}, "
+                f"expected_salary={profile.expected_salary_min_k}-{profile.expected_salary_max_k}"
+            ),
             "message": "",
         }
     else:
@@ -51,6 +61,7 @@ def main() -> None:
             "reason": match.reason,
             "message": message,
             "salary_min_k": min_k,
+            "salary_max_k": max_k,
             "city_ok": city_ok,
             "salary_ok": salary_ok,
         }

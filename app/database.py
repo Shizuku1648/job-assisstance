@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +11,7 @@ from app.models import UserProfile
 
 
 def utc_now() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 class Database:
@@ -32,6 +32,7 @@ class Database:
                 create table if not exists user_profile (
                     id integer primary key check (id = 1),
                     expected_salary_min_k integer not null,
+                    expected_salary_max_k integer not null,
                     candidate_cities text not null,
                     description text not null,
                     updated_at text not null
@@ -70,16 +71,33 @@ class Database:
                 );
                 """
             )
+            profile_columns = {
+                row["name"] for row in conn.execute("pragma table_info(user_profile)").fetchall()
+            }
+            if "expected_salary_max_k" not in profile_columns:
+                conn.execute(
+                    "alter table user_profile add column expected_salary_max_k integer not null default 25"
+                )
+                conn.execute(
+                    """
+                    update user_profile
+                    set expected_salary_max_k = case
+                        when expected_salary_min_k > 25 then expected_salary_min_k
+                        else 25
+                    end
+                    """
+                )
             row = conn.execute("select id from user_profile where id = 1").fetchone()
             if row is None:
                 conn.execute(
                     """
                     insert into user_profile
-                        (id, expected_salary_min_k, candidate_cities, description, updated_at)
-                    values (1, ?, ?, ?, ?)
+                        (id, expected_salary_min_k, expected_salary_max_k, candidate_cities, description, updated_at)
+                    values (1, ?, ?, ?, ?, ?)
                     """,
                     (
                         DEFAULT_PROFILE.expected_salary_min_k,
+                        DEFAULT_PROFILE.expected_salary_max_k,
                         json.dumps(DEFAULT_PROFILE.candidate_cities, ensure_ascii=False),
                         DEFAULT_PROFILE.description,
                         utc_now(),
@@ -93,6 +111,7 @@ class Database:
             return DEFAULT_PROFILE
         return UserProfile(
             expected_salary_min_k=int(row["expected_salary_min_k"]),
+            expected_salary_max_k=int(row["expected_salary_max_k"]),
             candidate_cities=json.loads(row["candidate_cities"]),
             description=row["description"],
         )
@@ -102,16 +121,18 @@ class Database:
             conn.execute(
                 """
                 insert into user_profile
-                    (id, expected_salary_min_k, candidate_cities, description, updated_at)
-                values (1, ?, ?, ?, ?)
+                    (id, expected_salary_min_k, expected_salary_max_k, candidate_cities, description, updated_at)
+                values (1, ?, ?, ?, ?, ?)
                 on conflict(id) do update set
                     expected_salary_min_k = excluded.expected_salary_min_k,
+                    expected_salary_max_k = excluded.expected_salary_max_k,
                     candidate_cities = excluded.candidate_cities,
                     description = excluded.description,
                     updated_at = excluded.updated_at
                 """,
                 (
                     profile.expected_salary_min_k,
+                    profile.expected_salary_max_k,
                     json.dumps(profile.candidate_cities, ensure_ascii=False),
                     profile.description,
                     utc_now(),
@@ -147,6 +168,16 @@ class Database:
             )
             return int(cursor.lastrowid)
 
+    def find_latest_job_by_url(self, url: str) -> dict[str, Any] | None:
+        if not url:
+            return None
+        with self.connect() as conn:
+            row = conn.execute(
+                "select * from jobs where url = ? order by id desc limit 1",
+                (url,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def update_job_match(
         self,
         job_id: int,
@@ -180,19 +211,34 @@ class Database:
                 ),
             )
 
-    def mark_job_contacted(self, job_id: int) -> None:
+    def mark_job_contacted(self, job_id: int, contacted_at: str | None = None) -> None:
         now = utc_now()
+        contact_time = contacted_at or now
         with self.connect() as conn:
             conn.execute(
                 """
                 update jobs
                 set status = 'contacted',
-                    contacted_at = ?,
+                    contacted_at = coalesce(contacted_at, ?),
                     updated_at = ?
                 where id = ?
                 """,
-                (now, now, job_id),
+                (contact_time, now, job_id),
             )
+
+    def count_contacted_between(self, start_utc: str, end_utc: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                select count(*) as total
+                from jobs
+                where contacted_at is not null
+                  and contacted_at >= ?
+                  and contacted_at < ?
+                """,
+                (start_utc, end_utc),
+            ).fetchone()
+        return int(row["total"])
 
     def list_jobs(self, page: int = 1, page_size: int = 20) -> dict[str, Any]:
         page = max(page, 1)

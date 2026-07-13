@@ -1,11 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawnSync, spawn } from "node:child_process";
 
 const root = path.resolve(import.meta.dirname, "..");
 const cdpUrl = process.env.EDGE_CDP_URL || "http://127.0.0.1:9222";
 const logDir = path.join(root, "runtime", "logs");
-const docsDir = path.join(root, "docs");
+const docsDir = path.join(root, "runtime", "reports");
 fs.mkdirSync(logDir, { recursive: true });
 fs.mkdirSync(docsDir, { recursive: true });
 
@@ -20,10 +20,10 @@ function decodeBossText(text = "") {
   return Array.from(text).map((char) => digitMap.get(char) || char).join("");
 }
 
-function minSalaryK(text = "") {
+function salaryRangeK(text = "") {
   const decoded = decodeBossText(text);
   const match = decoded.match(/(\d+)\s*-\s*(\d+)\s*K/i);
-  return match ? Number(match[1]) : null;
+  return match ? { minK: Number(match[1]), maxK: Number(match[2]) } : null;
 }
 
 function stamp() {
@@ -38,14 +38,101 @@ async function fetchJson(url) {
   return await response.json();
 }
 
-async function pageTarget() {
+async function pageTarget(prefer = "jobs", timeoutMs = 0, urlMarker = "") {
+  const preferredPath = prefer === "chat" ? "/web/geek/chat" : "/web/geek/jobs";
+  const fallbackPath = prefer === "chat" ? "/web/geek/jobs" : "/web/geek/chat";
+  const deadline = Date.now() + timeoutMs;
+
+  do {
+    try {
+      const targets = await fetchJson(`${cdpUrl.replace(/\/$/, "")}/json`);
+      const usablePages = targets.filter((target) =>
+        target.type === "page" &&
+        target.url.includes("zhipin.com") &&
+        (target.url.includes("/web/geek/jobs") || target.url.includes("/web/geek/chat"))
+      );
+      const page =
+        usablePages.find((target) => target.url.includes(preferredPath) && (!urlMarker || target.url.includes(urlMarker))) ||
+        (!urlMarker ? usablePages.find((target) => target.url.includes(fallbackPath)) : null);
+      if (page) return page;
+    } catch (error) {
+      if (Date.now() >= deadline) throw error;
+    }
+    if (Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 300));
+  } while (Date.now() < deadline);
+
+  throw new Error(`No usable zhipin ${prefer} page target found`);
+}
+
+function isBossAutomationPage(target) {
+  if (target.type !== "page" || !target.url.includes("zhipin.com")) return false;
+  return target.url.includes("/web/geek/jobs") ||
+    target.url.includes("/web/geek/chat") ||
+    target.url.includes("/web/user") ||
+    target.url === "https://www.zhipin.com/";
+}
+
+async function closeDuplicateBossPages(keepTargetId) {
   const targets = await fetchJson(`${cdpUrl.replace(/\/$/, "")}/json`);
-  const page = targets.find((target) => target.type === "page" && target.url.includes("zhipin.com"));
-  if (!page) throw new Error("No zhipin page target found");
-  if (page.url === "https://www.zhipin.com/" || page.url.includes("/web/user")) {
-    throw new Error(`Unexpected page url: ${page.url}`);
+  const duplicates = targets.filter((target) =>
+    isBossAutomationPage(target) && target.id !== keepTargetId
+  );
+  for (const target of duplicates) {
+    const response = await fetch(
+      `${cdpUrl.replace(/\/$/, "")}/json/close/${encodeURIComponent(target.id)}`,
+      { method: "PUT" },
+    );
+    if (!response.ok) throw new Error(`close duplicate target ${target.id} HTTP ${response.status}`);
   }
-  return page;
+}
+
+async function navigateTargetToJobs(target) {
+  const ws = await connect(target.webSocketDebuggerUrl);
+  try {
+    await sendCdp(ws, "Page.navigate", { url: "https://www.zhipin.com/web/geek/jobs" });
+  } finally {
+    ws.close();
+  }
+  return await pageTarget("jobs", 15000);
+}
+
+async function openJobsPage() {
+  let targets = [];
+  try {
+    targets = await fetchJson(`${cdpUrl.replace(/\/$/, "")}/json`);
+  } catch {
+    // CDP is not running yet; launch the project browser below.
+  }
+  const bossPages = targets.filter(isBossAutomationPage);
+  const reusable =
+    bossPages.find((target) => target.url.includes("/web/geek/jobs")) ||
+    bossPages.find((target) => target.url.includes("/web/geek/chat")) ||
+    bossPages[0];
+  if (reusable) {
+    await closeDuplicateBossPages(reusable.id);
+    return reusable.url.includes("/web/geek/jobs")
+      ? reusable
+      : await navigateTargetToJobs(reusable);
+  }
+
+  const edgePaths = [
+    "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+    "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+  ];
+  const edgePath = edgePaths.find((candidate) => fs.existsSync(candidate));
+  if (!edgePath) throw new Error("Microsoft Edge executable not found");
+  const userDataDir = path.join(root, "runtime", "edge-profile");
+  spawn(edgePath, [
+    "--remote-debugging-port=9222",
+    `--user-data-dir=${userDataDir}`,
+    "https://www.zhipin.com/web/geek/jobs",
+  ], {
+    detached: true,
+    stdio: "ignore",
+  }).unref();
+  const target = await pageTarget("jobs", 15000);
+  await closeDuplicateBossPages(target.id);
+  return target;
 }
 
 function connect(wsUrl) {
@@ -59,15 +146,40 @@ function connect(wsUrl) {
 function sendCdp(ws, method, params = {}) {
   const id = sendCdp.nextId++;
   return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      ws.removeEventListener("message", onMessage);
+      ws.removeEventListener("close", onClose);
+      ws.removeEventListener("error", onError);
+    };
     const onMessage = (event) => {
       const message = JSON.parse(event.data);
       if (message.id !== id) return;
-      ws.removeEventListener("message", onMessage);
+      cleanup();
       if (message.error) reject(new Error(`${method}: ${JSON.stringify(message.error)}`));
       else resolve(message.result);
     };
+    const onClose = () => {
+      cleanup();
+      reject(new Error(`${method}: CDP target closed`));
+    };
+    const onError = () => {
+      cleanup();
+      reject(new Error(`${method}: CDP websocket error`));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`${method}: CDP response timeout`));
+    }, 15000);
     ws.addEventListener("message", onMessage);
-    ws.send(JSON.stringify({ id, method, params }));
+    ws.addEventListener("close", onClose, { once: true });
+    ws.addEventListener("error", onError, { once: true });
+    try {
+      ws.send(JSON.stringify({ id, method, params }));
+    } catch (error) {
+      cleanup();
+      reject(error);
+    }
   });
 }
 sendCdp.nextId = 1;
@@ -130,9 +242,9 @@ JSON.stringify((() => {
     dialogs,
     bodyText: textOf(document.body).slice(0, 5000),
     flags: {
-      sentDialog: document.body.innerText.includes('已向BOSS发送消息'),
-      continueChat: document.body.innerText.includes('继续沟通'),
-      captchaOrLogin: /验证码|登录|安全验证/.test(document.body.innerText),
+      sentDialog: (document.body?.innerText || '').includes('已向BOSS发送消息'),
+      continueChat: (document.body?.innerText || '').includes('继续沟通'),
+      captchaOrLogin: /验证码|登录|安全验证/.test(document.body?.innerText || ''),
     },
   };
 })())
@@ -142,10 +254,46 @@ async function snapshot(ws) {
   return await evalJson(ws, snapshotExpression);
 }
 
+async function ensureShanghaiIntent(ws) {
+  return await evalJson(ws, String.raw`
+new Promise((resolve) => {
+  const clean = (value) => (value || '').toString().replace(/\s+/g, ' ').trim();
+  const before = {
+    href: location.href,
+    title: document.title,
+    activeIntent: clean(document.querySelector('a.expect-item.active')?.innerText),
+    intents: Array.from(document.querySelectorAll('a.expect-item')).map((el, index) => ({
+      index,
+      text: clean(el.innerText || el.textContent),
+      active: el.classList.contains('active'),
+    })),
+  };
+  const shanghai = Array.from(document.querySelectorAll('a.expect-item')).find((el) => clean(el.innerText || el.textContent).includes('上海'));
+  if (!shanghai) return resolve(JSON.stringify({ clicked: false, reason: 'shanghai_intent_not_found', before }));
+  if (shanghai.classList.contains('active')) return resolve(JSON.stringify({ clicked: false, reason: 'already_active', before }));
+  shanghai.click();
+  setTimeout(() => {
+    const locations = Array.from(document.querySelectorAll('.job-card-wrap .company-location')).slice(0, 8).map((el) => clean(el.innerText || el.textContent));
+    resolve(JSON.stringify({
+      clicked: true,
+      before,
+      after: {
+        href: location.href,
+        title: document.title,
+        activeIntent: clean(document.querySelector('a.expect-item.active')?.innerText),
+        locations,
+        jobCount: document.querySelectorAll('.job-card-wrap').length,
+      },
+    }));
+  }, 2500);
+})
+`);
+}
+
 function selectCandidate(jobs) {
   const scored = jobs.map((job) => {
     const decodedText = decodeBossText(job.text);
-    const minK = minSalaryK(job.text);
+    const salaryRange = salaryRangeK(job.text);
     const keywordScore = [
       /AI\s*Agent/i,
       /Agent/i,
@@ -157,10 +305,16 @@ function selectCandidate(jobs) {
       /RAG/i,
       /应用开发/,
     ].reduce((score, regex) => score + (regex.test(decodedText) ? 1 : 0), 0);
-    return { ...job, decodedText, minK, keywordScore };
+    return {
+      ...job,
+      decodedText,
+      minK: salaryRange?.minK ?? null,
+      maxK: salaryRange?.maxK ?? null,
+      keywordScore,
+    };
   });
   const candidates = scored
-    .filter((job) => job.city.includes("上海") && job.minK !== null && job.minK >= 20 && job.keywordScore > 0)
+    .filter((job) => job.city.includes("上海") && job.minK !== null && job.maxK !== null && job.keywordScore > 0)
     .sort((a, b) => b.keywordScore - a.keywordScore || b.minK - a.minK || a.index - b.index);
   return { scored, candidates, candidate: candidates[0] };
 }
@@ -177,7 +331,7 @@ new Promise((resolve) => {
   setTimeout(() => resolve(JSON.stringify({
     clicked: true,
     stillVisible: !!document.querySelector('.greet-boss-dialog'),
-    bodyHasSentDialog: document.body.innerText.includes('已向BOSS发送消息'),
+    bodyHasSentDialog: (document.body?.innerText || '').includes('已向BOSS发送消息'),
     href: location.href,
     title: document.title,
   })), 800);
@@ -212,8 +366,8 @@ new Promise((resolve) => {
           href: location.href,
           activeTitle: clean(document.querySelector('.job-card-wrap.active a.job-name')?.innerText),
           detailTitle: clean(detailRoot.querySelector('.job-name, h1, h2, .name')?.innerText),
-          bodyHasSentDialog: document.body.innerText.includes('已向BOSS发送消息'),
-          captchaOrLogin: /验证码|登录|安全验证/.test(document.body.innerText),
+          bodyHasSentDialog: (document.body?.innerText || '').includes('已向BOSS发送消息'),
+          captchaOrLogin: /验证码|登录|安全验证/.test(document.body?.innerText || ''),
         },
       }));
     }, 2500);
@@ -301,7 +455,7 @@ new Promise((resolve) => {
         clicked: true,
         href: location.href,
         title: document.title,
-        sentDialog: !!dialog && document.body.innerText.includes('已向BOSS发送消息'),
+        sentDialog: !!dialog && (document.body?.innerText || '').includes('已向BOSS发送消息'),
         dialogText: clean(dialog?.innerText).slice(0, 1000),
         buttons: Array.from((dialog || document).querySelectorAll('a, button')).map((el, index) => ({
           index,
@@ -309,7 +463,7 @@ new Promise((resolve) => {
           className: (el.className || '').toString(),
           href: el.href || '',
         })).filter((item) => item.text).slice(0, 40),
-        captchaOrLogin: /验证码|登录|安全验证/.test(document.body.innerText),
+        captchaOrLogin: /验证码|登录|安全验证/.test(document.body?.innerText || ''),
       }));
     }, 3000);
   }, 300);
@@ -317,7 +471,7 @@ new Promise((resolve) => {
 `);
 }
 
-async function continueToChat(ws) {
+async function continueToChat(ws, candidate) {
   try {
     return await evalJson(ws, String.raw`
 new Promise((resolve) => {
@@ -346,16 +500,17 @@ new Promise((resolve) => {
       clicked: true,
       href: location.href,
       title: document.title,
-      bodySample: clean(document.body.innerText).slice(0, 3000),
+      bodySample: clean(document.body?.innerText).slice(0, 3000),
       inputs,
       buttons,
-      captchaOrLogin: /验证码|登录|安全验证/.test(document.body.innerText),
+      captchaOrLogin: /验证码|登录|安全验证/.test(document.body?.innerText || ''),
     }));
   }, 3500);
 })
 `);
   } catch (error) {
-    const target = await pageTarget();
+    const jobId = (candidate?.href || "").match(/job_detail\/([^.?/]+)/)?.[1] || "";
+    const target = await pageTarget("chat", 10000, jobId);
     const newWs = await connect(target.webSocketDebuggerUrl);
     try {
       const state = await evalJson(newWs, String.raw`
@@ -382,10 +537,10 @@ JSON.stringify((() => {
     navigationError: ${JSON.stringify(String(error.message || error))},
     href: location.href,
     title: document.title,
-    bodySample: clean(document.body.innerText).slice(0, 3000),
+    bodySample: clean(document.body?.innerText).slice(0, 3000),
     inputs,
     buttons,
-    captchaOrLogin: /验证码|登录|安全验证/.test(document.body.innerText),
+    captchaOrLogin: /验证码|登录|安全验证/.test(document.body?.innerText || ''),
   };
 })())
 `);
@@ -403,44 +558,57 @@ new Promise((resolve) => {
   const candidateTitle = ${JSON.stringify(candidate.title)};
   const clean = (value) => (value || '').toString().replace(/\\s+/g, ' ').trim();
   const visible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
-  const input = Array.from(document.querySelectorAll('textarea, [contenteditable=true], [contenteditable="true"]'))
-    .find((el) => visible(el) && !el.disabled && !el.readOnly);
-  if (!input) return resolve(JSON.stringify({ sent: false, reason: 'input_not_found', href: location.href, title: document.title }));
-  if (!document.body.innerText.includes(candidateTitle)) {
-    return resolve(JSON.stringify({ sent: false, reason: 'candidate_title_not_visible_in_chat', candidateTitle, href: location.href, title: document.title }));
-  }
-  input.focus();
-  if (input.tagName.toLowerCase() === 'textarea') {
-    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-    setter ? setter.call(input, message) : (input.value = message);
-  } else {
-    input.textContent = message;
-  }
-  input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: message }));
-  input.dispatchEvent(new Event('change', { bubbles: true }));
-  setTimeout(() => {
-    const buttons = Array.from(document.querySelectorAll('button, a')).filter(visible);
-    const sendButton = buttons.find((el) => clean(el.innerText || el.textContent) === '发送' && !(el.className || '').toString().includes('disabled'));
-    if (!sendButton) {
-      return resolve(JSON.stringify({
-        sent: false,
-        reason: 'send_button_not_found',
-        inputText: clean(input.value || input.innerText || input.textContent),
+  const startedAt = Date.now();
+  const findInput = () => document.querySelector('#chat-input.chat-input') ||
+    Array.from(document.querySelectorAll('textarea, .chat-input, [contenteditable=true], [contenteditable="true"]'))
+      .find((el) => visible(el) && !el.disabled && !el.readOnly);
+  const sendWhenReady = () => {
+    const input = findInput();
+    const candidateVisible = (document.body?.innerText || '').includes(candidateTitle);
+    if ((!input || !candidateVisible) && Date.now() - startedAt < 10000) {
+      return setTimeout(sendWhenReady, 250);
+    }
+    if (!input) return resolve(JSON.stringify({ sent: false, reason: 'input_not_found', href: location.href, title: document.title }));
+    if (!candidateVisible) {
+      return resolve(JSON.stringify({ sent: false, reason: 'candidate_title_not_visible_in_chat', candidateTitle, href: location.href, title: document.title }));
+    }
+    if ((document.body?.innerText || '').includes(message)) {
+      return resolve(JSON.stringify({ sent: true, reason: 'message_already_visible', href: location.href, title: document.title }));
+    }
+    input.focus();
+    if (input.tagName.toLowerCase() === 'textarea') {
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+      setter ? setter.call(input, message) : (input.value = message);
+    } else {
+      input.textContent = message;
+    }
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: message }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    setTimeout(() => {
+      const buttons = Array.from(document.querySelectorAll('button, a')).filter(visible);
+      const sendButton = buttons.find((el) => clean(el.innerText || el.textContent) === '发送' && !(el.className || '').toString().includes('disabled'));
+      if (!sendButton) {
+        return resolve(JSON.stringify({
+          sent: false,
+          reason: 'send_button_not_found',
+          inputText: clean(input.value || input.innerText || input.textContent),
+          href: location.href,
+          title: document.title,
+          visibleButtons: buttons.map((el) => clean(el.innerText || el.textContent)).filter(Boolean).slice(0, 80),
+        }));
+      }
+      sendButton.click();
+      setTimeout(() => resolve(JSON.stringify({
+        sent: (document.body?.innerText || '').includes(message),
+        reason: (document.body?.innerText || '').includes(message) ? 'message_visible_after_send' : 'clicked_send_but_message_not_visible',
         href: location.href,
         title: document.title,
-        visibleButtons: buttons.map((el) => clean(el.innerText || el.textContent)).filter(Boolean).slice(0, 80),
-      }));
-    }
-    sendButton.click();
-    setTimeout(() => resolve(JSON.stringify({
-      sent: document.body.innerText.includes(message),
-      reason: document.body.innerText.includes(message) ? 'message_visible_after_send' : 'clicked_send_but_message_not_visible',
-      href: location.href,
-      title: document.title,
-      inputTextAfter: clean(input.value || input.innerText || input.textContent),
-      bodyHasMessage: document.body.innerText.includes(message),
-    })), 2500);
-  }, 700);
+        inputTextAfter: clean(input.value || input.innerText || input.textContent),
+        bodyHasMessage: (document.body?.innerText || '').includes(message),
+      })), 2500);
+    }, 700);
+  };
+  sendWhenReady();
 })
 `);
 }
@@ -470,19 +638,30 @@ function writeDocs(runId, payload) {
 
 async function main() {
   const runId = stamp();
-  const beforeTarget = await pageTarget();
+  const beforeTarget = await openJobsPage();
   let ws = await connect(beforeTarget.webSocketDebuggerUrl);
   const steps = [];
 
   const before = await snapshot(ws);
   steps.push({ step: "before", state: before });
+  if (!before.activeIntent.includes("上海") || !before.jobs.some((job) => job.city.includes("上海"))) {
+    const intentResult = await ensureShanghaiIntent(ws);
+    steps.push({ step: "ensure_shanghai_intent", result: intentResult, state: await snapshot(ws) });
+  }
   if (before.flags.sentDialog) {
     steps.push({ step: "dismiss_existing_greet_dialog", result: await dismissGreetDialog(ws) });
   }
 
-  const stateForSelection = await snapshot(ws);
-  const selection = selectCandidate(stateForSelection.jobs);
+  let stateForSelection = await snapshot(ws);
+  let selection = selectCandidate(stateForSelection.jobs);
   steps.push({ step: "select_candidates", state: stateForSelection, selection });
+  if (!selection.candidates.length) {
+    await sendCdp(ws, "Page.reload");
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    stateForSelection = await snapshot(ws);
+    selection = selectCandidate(stateForSelection.jobs);
+    steps.push({ step: "reload_and_select_candidates", state: stateForSelection, selection });
+  }
   if (!selection.candidates.length) throw new Error("No local-rule candidates found");
 
   let selectedCandidate = null;
@@ -515,6 +694,9 @@ async function main() {
     const attempt = { candidate, detailMatches, job, match };
     candidateAttempts.push(attempt);
     steps.push({ step: "extract_and_match_candidate", attempt });
+    if (match.result.skipped) {
+      continue;
+    }
     if (match.result.matched) {
       selectedCandidate = candidate;
       selectedJob = job;
@@ -572,15 +754,16 @@ async function main() {
     immediate = await clickImmediate(ws);
     steps.push({ step: "click_immediate", result: immediate, state: await snapshot(ws) });
     if (immediate.clicked && immediate.sentDialog && !immediate.captchaOrLogin) {
-      continueChat = await continueToChat(ws);
+      continueChat = await continueToChat(ws, selectedCandidate);
       let postContinueState = null;
-      if (continueChat.reconnectedAfterNavigation || (continueChat.href || "").includes("/web/geek/chat")) {
+      if (continueChat.reconnectedAfterNavigation) {
         try {
           ws.close();
         } catch {
           // The page may have already navigated away from the old inspected target.
         }
-        const chatTarget = await pageTarget();
+        const jobId = (selectedCandidate.href || "").match(/job_detail\/([^.?/]+)/)?.[1] || "";
+        const chatTarget = await pageTarget("chat", 10000, jobId);
         ws = await connect(chatTarget.webSocketDebuggerUrl);
       }
       try {
@@ -637,6 +820,7 @@ async function main() {
       title: selectedCandidate.title,
       city: selectedCandidate.city,
       minK: selectedCandidate.minK,
+      maxK: selectedCandidate.maxK,
       keywordScore: selectedCandidate.keywordScore,
     },
     match: selectedMatch.result,

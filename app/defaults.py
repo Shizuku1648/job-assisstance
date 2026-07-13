@@ -3,6 +3,7 @@ from app.models import UserProfile
 
 DEFAULT_PROFILE = UserProfile(
     expected_salary_min_k=20,
+    expected_salary_max_k=25,
     candidate_cities=["上海"],
     description=(
         "具备近 2 年 AI 应用开发与项目交付经验，主要方向包括企业级 AI 应用平台、"

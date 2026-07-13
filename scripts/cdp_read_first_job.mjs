@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 const root = path.resolve(import.meta.dirname, "..");
 const cdpUrl = process.env.EDGE_CDP_URL || "http://127.0.0.1:9222";
 const logDir = path.join(root, "runtime", "logs");
-const docsDir = path.join(root, "docs");
+const docsDir = path.join(root, "runtime", "reports");
 fs.mkdirSync(logDir, { recursive: true });
 fs.mkdirSync(docsDir, { recursive: true });
 

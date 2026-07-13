@@ -7,3 +7,6 @@ dependencies = [
     "playwright>=1.57.0",
     "uvicorn>=0.51.0",
 ]
+
+[project.scripts]
+jobseeker-agent = "app.cli:main"

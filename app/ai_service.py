@@ -20,6 +20,7 @@ class AIService:
             load_prompt("job_match_user.txt"),
             {
                 "expected_salary_min_k": profile.expected_salary_min_k,
+                "expected_salary_max_k": profile.expected_salary_max_k,
                 "candidate_cities": "、".join(profile.candidate_cities),
                 "profile_description": profile.description,
                 "job_title": job.title,
@@ -47,4 +48,8 @@ class AIService:
         )
         ai_match_note = self.client.chat_text(system_prompt, user_prompt).strip()
         fixed_intro = "您好，这是我本人开发的自动化求职程序发来的消息。"
-        return f"{fixed_intro}\n\nAI 对岗位匹配度的判断如下：\n{ai_match_note}"
+        fixed_outro = (
+            "如果您觉得合适，我也很愿意发送简历，期待进一步沟通。\n"
+            "项目地址：https://github.com/Shizuku1648/job-assisstance"
+        )
+        return f"{fixed_intro}\n\nAI 对岗位匹配度的判断如下：\n{ai_match_note}\n\n{fixed_outro}"

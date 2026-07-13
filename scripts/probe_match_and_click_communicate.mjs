@@ -4,7 +4,7 @@ import path from "node:path";
 const root = path.resolve(import.meta.dirname, "..");
 const cdpUrl = process.env.EDGE_CDP_URL || "http://127.0.0.1:9222";
 const logDir = path.join(root, "runtime", "logs");
-const docsDir = path.join(root, "docs");
+const docsDir = path.join(root, "runtime", "reports");
 fs.mkdirSync(logDir, { recursive: true });
 fs.mkdirSync(docsDir, { recursive: true });
 
@@ -17,9 +17,9 @@ function decodeSalary(text = "") {
   return Array.from(text).map((char) => digitMap.get(char) || char).join("");
 }
 
-function minSalaryK(text = "") {
+function salaryRangeK(text = "") {
   const match = decodeSalary(text).match(/(\d+)\s*-\s*(\d+)\s*K/i);
-  return match ? Number(match[1]) : null;
+  return match ? { minK: Number(match[1]), maxK: Number(match[2]) } : null;
 }
 
 function stamp() {
@@ -112,7 +112,7 @@ async function selectBestJob(ws) {
   })())`);
   const jobs = JSON.parse(raw).map((job) => {
     const decodedText = decodeSalary(job.text);
-    const minK = minSalaryK(job.text);
+    const salaryRange = salaryRangeK(job.text);
     const keywordScore = [
       /AI\s*Agent/i,
       /Agent/i,
@@ -124,10 +124,10 @@ async function selectBestJob(ws) {
       /RAG/i,
       /应用开发/,
     ].reduce((score, regex) => score + (regex.test(job.text) ? 1 : 0), 0);
-    return { ...job, decodedText, minK, keywordScore };
+    return { ...job, decodedText, minK: salaryRange?.minK ?? null, maxK: salaryRange?.maxK ?? null, keywordScore };
   });
   const candidate = jobs
-    .filter((job) => job.city.includes("上海") && job.minK !== null && job.minK >= 20 && job.keywordScore > 0)
+    .filter((job) => job.city.includes("上海") && job.minK !== null && job.maxK !== null && job.keywordScore > 0)
     .sort((a, b) => b.keywordScore - a.keywordScore || a.index - b.index)[0];
   return { jobs, candidate };
 }
@@ -257,7 +257,7 @@ async function main() {
     `- index：${candidate.index}`,
     `- 岗位：${candidate.title}`,
     `- 城市：${candidate.city}`,
-    `- 薪资下限：${candidate.minK}k`,
+    `- 薪资范围：${candidate.minK}-${candidate.maxK}k`,
     `- URL：${candidate.url}`,
     "",
     "### 立即沟通点击后检测",

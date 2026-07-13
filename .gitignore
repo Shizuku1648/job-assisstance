@@ -10,6 +10,7 @@ runtime/edge-profile/
 runtime/job_assistance.db
 runtime/*.db
 runtime/logs/
+runtime/reports/
 runtime/screenshots/
 runtime/traces/
 

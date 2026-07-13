@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from app.automation.artifacts import append_markdown, ensure_file, local_now_slug
 from app.automation.edge import cdp_port_is_open, launch_edge_for_cdp, open_edge_url, wait_for_cdp
-from app.config import Settings
+from app.config import ROOT_DIR, Settings
+from app.contact_quota import BOSS_TIMEZONE, get_contact_quota, utc_text
 from app.database import Database
 from app.models import WorkerStatus
 
@@ -19,6 +22,7 @@ class BossWorker:
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
         self._status = WorkerStatus(False, "idle", "未运行")
+        self._reconcile_contact_history()
 
     @property
     def status(self) -> WorkerStatus:
@@ -29,6 +33,13 @@ class BossWorker:
             return False
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run_explore())
+        return True
+
+    async def start_contact_loop(self, limit: int = 1) -> bool:
+        if self._task and not self._task.done():
+            return False
+        self._stop_event.clear()
+        self._task = asyncio.create_task(self._run_contact_loop(limit=limit))
         return True
 
     async def explore_once(self) -> WorkerStatus:
@@ -182,6 +193,148 @@ class BossWorker:
             )
             self._status = WorkerStatus(False, "error", f"探索失败：{exc}")
 
+    async def _run_contact_loop(self, limit: int) -> None:
+        run_id = local_now_slug()
+        self._ensure_artifacts()
+        self._status = WorkerStatus(True, "contact_loop", f"开始运行，目标沟通 {limit} 位 Boss")
+        results: list[dict[str, Any]] = []
+        max_attempts_per_iteration = 3
+        quota_exhausted = False
+
+        try:
+            for index in range(limit):
+                if self._stop_event.is_set():
+                    break
+                iteration_contacted = False
+                for attempt in range(1, max_attempts_per_iteration + 1):
+                    quota = get_contact_quota(self.db, self.settings.daily_contact_limit)
+                    if quota["remaining"] <= 0:
+                        quota_exhausted = True
+                        break
+                    self._status = WorkerStatus(
+                        True,
+                        "contact_loop",
+                        f"正在沟通第 {index + 1}/{limit} 位 Boss（尝试 {attempt}/{max_attempts_per_iteration}）",
+                    )
+                    result = await asyncio.to_thread(self._run_contact_once, run_id, index + 1)
+                    result["attempt"] = attempt
+                    results.append(result)
+                    if result.get("contacted"):
+                        iteration_contacted = True
+                        break
+                    if self._stop_event.is_set():
+                        break
+                    await asyncio.sleep(2)
+                if not iteration_contacted:
+                    break
+                await asyncio.sleep(1.5)
+
+            contacted_count = sum(1 for item in results if item.get("contacted"))
+            success_count = sum(1 for item in results if item.get("success"))
+            payload = {
+                "run_id": run_id,
+                "limit": limit,
+                "contacted_count": contacted_count,
+                "success_count": success_count,
+                "attempt_count": len(results),
+                "quota_exhausted": quota_exhausted,
+                "quota": get_contact_quota(self.db, self.settings.daily_contact_limit),
+                "results": results,
+            }
+            loop_log_path = self.settings.logs_dir / f"{run_id}-contact-loop.json"
+            loop_log_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.db.log_event(
+                event_type="contact_loop",
+                action="run_contact_loop",
+                after_state=json.dumps(payload, ensure_ascii=False)[:4000],
+                success=contacted_count == limit,
+            )
+            append_markdown(
+                self.settings.docs_dir / "boss-test-runs.md",
+                "\n".join(
+                    [
+                        f"## {run_id} 批量沟通",
+                        "",
+                        f"- 目标沟通数：{limit}",
+                        f"- 尝试次数：{len(results)}",
+                        f"- 实际沟通数：{contacted_count}",
+                        f"- 自定义消息发送成功数：{success_count}",
+                        f"- 完整日志：`{loop_log_path}`",
+                        f"- 结果：`{json.dumps(results, ensure_ascii=False)[:1000]}`",
+                    ]
+                ),
+            )
+            self._status = WorkerStatus(
+                False,
+                "idle",
+                f"运行结束：已沟通 {contacted_count}/{limit} 位 Boss，消息发送成功 {success_count} 次",
+            )
+        except Exception as exc:
+            self.db.log_event(
+                event_type="contact_loop_failed",
+                action="run_contact_loop",
+                after_state=json.dumps({"run_id": run_id, "results": results}, ensure_ascii=False)[:4000],
+                success=False,
+                error=str(exc),
+            )
+            self._status = WorkerStatus(False, "error", f"运行失败：{exc}")
+
+    def _run_contact_once(self, run_id: str, iteration: int) -> dict[str, Any]:
+        command = ["node", "scripts\\run_boss_match_communicate_send.mjs", "--send"]
+        completed = subprocess.run(
+            command,
+            cwd=ROOT_DIR,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=300,
+        )
+        result: dict[str, Any] = {
+            "iteration": iteration,
+            "returncode": completed.returncode,
+            "success": completed.returncode == 0,
+            "contacted": False,
+            "stdout_tail": completed.stdout[-4000:],
+            "stderr_tail": completed.stderr[-4000:],
+        }
+        if completed.returncode == 0:
+            try:
+                parsed = json.loads(completed.stdout)
+                result["parsed"] = parsed
+                immediate = parsed.get("immediate", {})
+                job_id = parsed.get("match", {}).get("job_id")
+                contacted = bool(job_id) and bool(immediate.get("clicked")) and bool(
+                    immediate.get("sentDialog") or parsed.get("sendMessage", {}).get("sent")
+                )
+                result["contacted"] = contacted
+                result["success"] = bool(parsed.get("safe")) and bool(parsed.get("sendMessage", {}).get("sent"))
+                if contacted:
+                    self.db.mark_job_contacted(int(job_id))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                result["success"] = False
+        return result
+
+    def _reconcile_contact_history(self) -> None:
+        for log_path in self.settings.logs_dir.glob("*-match-communicate-send.json"):
+            try:
+                payload = json.loads(log_path.read_text(encoding="utf-8"))
+                immediate = payload.get("immediate", {})
+                contacted = bool(immediate.get("clicked")) and bool(
+                    immediate.get("sentDialog") or payload.get("sendMessage", {}).get("sent")
+                )
+                job_id = payload.get("match", {}).get("result", {}).get("job_id")
+                if not contacted or not job_id:
+                    continue
+                run_id = str(payload.get("runId", ""))
+                try:
+                    local_time = datetime.strptime(run_id, "%Y%m%d-%H%M%S").replace(tzinfo=BOSS_TIMEZONE)
+                except ValueError:
+                    local_time = datetime.fromtimestamp(log_path.stat().st_mtime, tz=BOSS_TIMEZONE)
+                self.db.mark_job_contacted(int(job_id), contacted_at=utc_text(local_time))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+
     async def _capture_jobs_page(self, screenshot_path: Path) -> dict[str, Any]:
         return await self._open_page_and_capture(self.settings.boss_jobs_url, screenshot_path, check_homepage=True)
 
@@ -266,17 +419,23 @@ class BossWorker:
             if page.is_closed():
                 raise RuntimeError("页面被关闭，无法保存登录态")
 
+            page_url = page.url
+            page_title = await self._safe_title(page)
             self.settings.auth_state_path.parent.mkdir(parents=True, exist_ok=True)
             await context.storage_state(path=str(self.settings.auth_state_path))
 
             screenshot_path = self.settings.screenshots_dir / f"{local_now_slug()}-auth-state.png"
             screenshot_path.parent.mkdir(parents=True, exist_ok=True)
-            await page.screenshot(path=str(screenshot_path), full_page=True)
+            try:
+                await page.screenshot(path=str(screenshot_path), full_page=True)
+                saved_screenshot_path = str(screenshot_path)
+            except Exception:
+                saved_screenshot_path = ""
             return {
-                "url": page.url,
-                "title": await self._safe_title(page),
+                "url": page_url,
+                "title": page_title,
                 "auth_state_path": str(self.settings.auth_state_path),
-                "screenshot_path": str(screenshot_path),
+                "screenshot_path": saved_screenshot_path,
             }
 
     async def _collect_dom_snapshot(self, page: Any) -> dict[str, Any]:

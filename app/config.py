@@ -63,5 +63,5 @@ def get_settings() -> Settings:
         screenshots_dir=Path(_env("SCREENSHOTS_DIR", str(ROOT_DIR / "runtime" / "screenshots"))),
         traces_dir=Path(_env("TRACES_DIR", str(ROOT_DIR / "runtime" / "traces"))),
         logs_dir=Path(_env("LOGS_DIR", str(ROOT_DIR / "runtime" / "logs"))),
-        docs_dir=Path(_env("DOCS_DIR", str(ROOT_DIR / "docs"))),
+        docs_dir=Path(_env("DOCS_DIR", str(ROOT_DIR / "runtime" / "reports"))),
     )
