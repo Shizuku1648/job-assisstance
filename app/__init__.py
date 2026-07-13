@@ -1,0 +1,1 @@
+"""Job assistance application package."""

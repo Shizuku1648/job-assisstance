@@ -1,0 +1,14 @@
+候选人期望最低薪资：{{expected_salary_min_k}}k
+候选人候选城市：{{candidate_cities}}
+候选人描述：
+{{profile_description}}
+
+岗位名称：{{job_title}}
+公司名称：{{company}}
+岗位薪资：{{salary}}
+岗位城市：{{city}}
+岗位 URL：{{url}}
+JD：
+{{jd}}
+
+请判断该岗位是否值得自动触发“立即沟通”。

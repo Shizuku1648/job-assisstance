@@ -1,0 +1,9 @@
+[project]
+name = "job-assisstance"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.139.0",
+    "playwright>=1.57.0",
+    "uvicorn>=0.51.0",
+]
