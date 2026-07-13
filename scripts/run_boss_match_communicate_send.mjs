@@ -10,6 +10,9 @@ fs.mkdirSync(logDir, { recursive: true });
 fs.mkdirSync(docsDir, { recursive: true });
 
 const shouldSend = process.argv.includes("--send");
+const batchSizeArgIndex = process.argv.indexOf("--batch-size");
+const requestedBatchSize = batchSizeArgIndex >= 0 ? Number(process.argv[batchSizeArgIndex + 1]) : 1;
+const batchSize = Number.isInteger(requestedBatchSize) ? Math.min(Math.max(requestedBatchSize, 1), 10) : 1;
 
 const digitMap = new Map([
   ["\ue031", "0"], ["\ue032", "1"], ["\ue033", "2"], ["\ue034", "3"], ["\ue035", "4"],
@@ -194,6 +197,16 @@ async function evalJson(ws, expression) {
   return JSON.parse(value);
 }
 
+const securityPromptExpression = String.raw`(
+  location.pathname.startsWith('/web/user') ||
+  Array.from(document.querySelectorAll(
+    '[class*="captcha"], [class*="geetest"], [class*="verify"], [class*="login-dialog"], [class*="login-box"], [class*="security-check"]'
+  )).some((el) => {
+    const visible = !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+    return visible && /验证码|安全验证|请登录|扫码登录|手机号登录/.test(el.innerText || el.textContent || '');
+  })
+)`;
+
 const snapshotExpression = String.raw`
 JSON.stringify((() => {
   const clean = (value) => (value || '').toString().replace(/\s+/g, ' ').trim();
@@ -244,7 +257,7 @@ JSON.stringify((() => {
     flags: {
       sentDialog: (document.body?.innerText || '').includes('已向BOSS发送消息'),
       continueChat: (document.body?.innerText || '').includes('继续沟通'),
-      captchaOrLogin: /验证码|登录|安全验证/.test(document.body?.innerText || ''),
+      captchaOrLogin: ${securityPromptExpression},
     },
   };
 })())
@@ -252,6 +265,23 @@ JSON.stringify((() => {
 
 async function snapshot(ws) {
   return await evalJson(ws, snapshotExpression);
+}
+
+async function waitForJobCards(ws, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  let state = null;
+  do {
+    try {
+      state = await snapshot(ws);
+      if (state.jobs.length && state.activeIntent) {
+        return { ready: true, state };
+      }
+    } catch {
+      // Navigation can replace the execution context while the jobs page is loading.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  } while (Date.now() < deadline);
+  return { ready: false, state: state || await snapshot(ws) };
 }
 
 async function ensureShanghaiIntent(ws) {
@@ -348,6 +378,80 @@ new Promise((resolve) => {
 `);
 }
 
+async function returnToJobsPage(ws) {
+  let navigation = { method: "Page.navigate", historyEntryId: null };
+  try {
+    const history = await sendCdp(ws, "Page.getNavigationHistory");
+    const entry = [...(history.entries || [])].reverse().find((item) => item.url.includes("/web/geek/jobs"));
+    if (entry) {
+      navigation = { method: "Page.navigateToHistoryEntry", historyEntryId: entry.id };
+      await sendCdp(ws, "Page.navigateToHistoryEntry", { entryId: entry.id });
+    } else {
+      await sendCdp(ws, "Page.navigate", { url: "https://www.zhipin.com/web/geek/jobs" });
+    }
+  } catch (error) {
+    navigation.error = String(error.message || error);
+  }
+  try {
+    ws.close();
+  } catch {
+    // The chat target may already be navigating.
+  }
+  const target = await pageTarget("jobs", 15000);
+  const jobsWs = await connect(target.webSocketDebuggerUrl);
+  const ready = await waitForJobCards(jobsWs);
+  return { ws: jobsWs, result: { ...navigation, target: { id: target.id, url: target.url }, ready } };
+}
+
+async function restoreCandidate(ws, candidate) {
+  const maxScrolls = 20;
+  let reloads = 0;
+  for (let round = 0; round <= maxScrolls; round += 1) {
+    const clickResult = await clickJobHref(ws, candidate.href);
+    if (clickResult.clicked) {
+      const state = await snapshot(ws);
+      const restored = state.detailTitle.includes(candidate.title) && state.activeCardHref === candidate.href;
+      if (restored) return { restored: true, round, clickResult, state };
+    }
+    if (round === maxScrolls) break;
+    const scrollResult = await scrollJobList(ws);
+    if (!scrollResult.newUrls.length && reloads < 1 && round >= 2) {
+      reloads += 1;
+      await sendCdp(ws, "Page.reload");
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
+  }
+  try {
+    await sendCdp(ws, "Page.navigate", { url: candidate.href });
+    const deadline = Date.now() + 15000;
+    do {
+      try {
+        const state = await snapshot(ws);
+        const hasImmediate = state.buttons.some((button) => button.text === "立即沟通");
+        if (state.detailTitle.includes(candidate.title) && hasImmediate) {
+          return {
+            restored: true,
+            directNavigation: true,
+            round: maxScrolls + 1,
+            state,
+          };
+        }
+      } catch {
+        // The execution context is replaced while the detail page is loading.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    } while (Date.now() < deadline);
+  } catch (error) {
+    return {
+      restored: false,
+      reason: "candidate_direct_navigation_failed",
+      href: candidate.href,
+      error: String(error.message || error),
+    };
+  }
+  return { restored: false, reason: "candidate_url_not_found_after_scroll_or_direct_navigation", href: candidate.href };
+}
+
 function selectCandidate(jobs) {
   const scored = jobs.map((job) => {
     const decodedText = decodeBossText(job.text);
@@ -425,8 +529,36 @@ new Promise((resolve) => {
           activeTitle: clean(document.querySelector('.job-card-wrap.active a.job-name')?.innerText),
           detailTitle: clean(detailRoot.querySelector('.job-name, h1, h2, .name')?.innerText),
           bodyHasSentDialog: (document.body?.innerText || '').includes('已向BOSS发送消息'),
-          captchaOrLogin: /验证码|登录|安全验证/.test(document.body?.innerText || ''),
+          captchaOrLogin: ${securityPromptExpression},
         },
+      }));
+    }, 2500);
+  }, 300);
+})
+`);
+}
+
+async function clickJobHref(ws, href) {
+  return await evalJson(ws, `
+new Promise((resolve) => {
+  const targetHref = ${JSON.stringify(href)};
+  const targetPath = (() => { try { return new URL(targetHref).pathname; } catch { return targetHref; } })();
+  const links = Array.from(document.querySelectorAll('.job-card-wrap a.job-name'));
+  const link = links.find((item) => {
+    try { return new URL(item.href).pathname === targetPath; } catch { return item.href === targetHref; }
+  });
+  if (!link) return resolve(JSON.stringify({ clicked: false, reason: 'href_not_found', href: targetHref }));
+  link.scrollIntoView({ block: 'center' });
+  setTimeout(() => {
+    link.click();
+    setTimeout(() => {
+      const detailRoot = document.querySelector('.job-detail-container') || document.querySelector('.job-detail') || document;
+      const activeLink = document.querySelector('.job-card-wrap.active a.job-name');
+      resolve(JSON.stringify({
+        clicked: true,
+        href: link.href,
+        activeHref: activeLink?.href || '',
+        detailTitle: (detailRoot.querySelector('.job-name, h1, h2, .name')?.innerText || '').trim(),
       }));
     }, 2500);
   }, 300);
@@ -467,18 +599,18 @@ JSON.stringify((() => {
 `);
 }
 
-function matchJobWithPython(runId, job) {
-  const snapshotPath = path.join(logDir, `${runId}-selected-job-snapshot.json`);
-  fs.writeFileSync(snapshotPath, JSON.stringify({ job }, null, 2), "utf8");
+function matchJobsWithPython(runId, batchIndex, jobs) {
+  const snapshotPath = path.join(logDir, `${runId}-job-batch-${batchIndex}.json`);
+  fs.writeFileSync(snapshotPath, JSON.stringify({ jobs }, null, 2), "utf8");
   const python = path.join(root, ".venv", "Scripts", "python.exe");
-  const result = spawnSync(python, ["scripts/match_job_snapshot.py", snapshotPath], {
+  const result = spawnSync(python, ["scripts/match_job_batch.py", snapshotPath], {
     cwd: root,
     encoding: "utf8",
     env: { ...process.env, PYTHONIOENCODING: "utf-8" },
-    timeout: 120000,
+    timeout: 180000,
   });
   if (result.status !== 0) {
-    throw new Error(`match_job_snapshot.py failed: ${result.stderr || result.stdout}`);
+    throw new Error(`match_job_batch.py failed: ${result.stderr || result.stdout}`);
   }
   return { snapshotPath, result: JSON.parse(result.stdout) };
 }
@@ -521,7 +653,7 @@ new Promise((resolve) => {
           className: (el.className || '').toString(),
           href: el.href || '',
         })).filter((item) => item.text).slice(0, 40),
-        captchaOrLogin: /验证码|登录|安全验证/.test(document.body?.innerText || ''),
+        captchaOrLogin: ${securityPromptExpression},
       }));
     }, 3000);
   }, 300);
@@ -561,7 +693,7 @@ new Promise((resolve) => {
       bodySample: clean(document.body?.innerText).slice(0, 3000),
       inputs,
       buttons,
-      captchaOrLogin: /验证码|登录|安全验证/.test(document.body?.innerText || ''),
+      captchaOrLogin: ${securityPromptExpression},
     }));
   }, 3500);
 })
@@ -598,7 +730,7 @@ JSON.stringify((() => {
     bodySample: clean(document.body?.innerText).slice(0, 3000),
     inputs,
     buttons,
-    captchaOrLogin: /验证码|登录|安全验证/.test(document.body?.innerText || ''),
+    captchaOrLogin: ${securityPromptExpression},
   };
 })())
 `);
@@ -700,8 +832,9 @@ async function main() {
   let ws = await connect(beforeTarget.webSocketDebuggerUrl);
   const steps = [];
 
-  const before = await snapshot(ws);
-  steps.push({ step: "before", state: before });
+  const initialReady = await waitForJobCards(ws);
+  const before = initialReady.state;
+  steps.push({ step: "before", ready: initialReady.ready, state: before });
   if (!before.activeIntent.includes("上海") || !before.jobs.some((job) => job.city.includes("上海"))) {
     const intentResult = await ensureShanghaiIntent(ws);
     steps.push({ step: "ensure_shanghai_intent", result: intentResult, state: await snapshot(ws) });
@@ -715,12 +848,49 @@ async function main() {
   let selectedMatch = null;
   let selectedState = null;
   const candidateAttempts = [];
+  const batchMatches = [];
+  const readyItems = [];
+  let pendingBatch = [];
   const attemptedUrls = new Set();
   const observedUrls = new Set();
   const maxScrollRounds = 20;
   const maxStagnantScrolls = 3;
+  const maxReloads = 1;
   let stagnantScrolls = 0;
+  let reloads = 0;
   let stateForSelection = await snapshot(ws);
+
+  const processPendingBatch = () => {
+    if (!pendingBatch.length) return false;
+    const batchIndex = batchMatches.length + 1;
+    const batchItems = pendingBatch;
+    pendingBatch = [];
+    const batchMatch = matchJobsWithPython(runId, batchIndex, batchItems.map((item) => item.job));
+    batchMatches.push(batchMatch);
+    steps.push({
+      step: "match_candidate_batch",
+      batchIndex,
+      requestedBatchSize: batchSize,
+      collectedCount: batchItems.length,
+      result: batchMatch.result,
+    });
+
+    for (const result of batchMatch.result.results || []) {
+      const item = batchItems[result.input_index] || batchItems.find((candidate) => candidate.job.url === result.url);
+      if (!item) continue;
+      item.match = { snapshotPath: batchMatch.snapshotPath, result };
+      if (result.matched && result.ready && result.message) {
+        readyItems.push(item);
+      }
+    }
+    const firstReady = readyItems[0];
+    if (!selectedCandidate && firstReady) {
+      selectedCandidate = firstReady.candidate;
+      selectedJob = firstReady.job;
+      selectedMatch = firstReady.match;
+    }
+    return Boolean(selectedCandidate);
+  };
 
   for (let round = 0; round <= maxScrollRounds && !selectedCandidate; round += 1) {
     const selection = selectCandidate(stateForSelection.jobs);
@@ -760,18 +930,11 @@ async function main() {
       }
 
       const job = await extractDetailJob(ws, candidate);
-      const match = matchJobWithPython(runId, job);
-      const attempt = { round, candidate, detailMatches, job, match };
+      const attempt = { round, candidate, detailMatches, job, match: null };
       candidateAttempts.push(attempt);
-      steps.push({ step: "extract_and_match_candidate", attempt });
-      if (match.result.skipped) {
-        continue;
-      }
-      if (match.result.matched) {
-        selectedCandidate = candidate;
-        selectedJob = job;
-        selectedMatch = match;
-        selectedState = afterClick;
+      pendingBatch.push(attempt);
+      steps.push({ step: "extract_candidate_for_batch", attempt });
+      if (pendingBatch.length >= batchSize && processPendingBatch()) {
         break;
       }
     }
@@ -793,8 +956,23 @@ async function main() {
     });
     stateForSelection = nextState;
     if (stagnantScrolls >= maxStagnantScrolls) {
-      break;
+      if (reloads >= maxReloads) break;
+      reloads += 1;
+      await sendCdp(ws, "Page.reload");
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      stateForSelection = await snapshot(ws);
+      stagnantScrolls = 0;
+      steps.push({
+        step: "reload_job_list_after_stagnation",
+        round,
+        reloads,
+        state: stateForSelection,
+      });
     }
+  }
+
+  if (!selectedCandidate && pendingBatch.length) {
+    processPendingBatch();
   }
 
   if (!selectedCandidate || !selectedJob || !selectedMatch) {
@@ -804,6 +982,8 @@ async function main() {
       safe: afterTarget.url.includes("zhipin.com") && afterTarget.url !== "https://www.zhipin.com/" && !afterTarget.url.includes("/web/user"),
       beforeTarget,
       afterTarget,
+      batchSize,
+      batchMatches,
       candidateAttempts,
       guard: { ok: false, reason: "滚动加载后仍未找到通过 AI 匹配的新岗位" },
       immediate: { clicked: false, reason: "no_ai_matched_candidate" },
@@ -819,6 +999,11 @@ async function main() {
     console.log(JSON.stringify({
       logPath,
       safe: payload.safe,
+      batchSize,
+      batchCount: batchMatches.length,
+      contactedCount: 0,
+      successCount: 0,
+      contacts: [],
       matchedCandidate: null,
       attempts: candidateAttempts.map((item) => ({
         index: item.candidate?.index,
@@ -827,6 +1012,7 @@ async function main() {
         city: item.candidate?.city,
         minK: item.candidate?.minK,
         maxK: item.candidate?.maxK,
+        ready: item.match?.result?.ready ?? false,
         matched: item.match?.result?.matched ?? false,
         reason: item.match?.result?.reason || item.reason || "",
       })),
@@ -835,47 +1021,91 @@ async function main() {
     return;
   }
 
-  const preImmediate = await snapshot(ws);
-  const guard = assertCanClickImmediate(selectedCandidate, preImmediate, selectedMatch.result);
-  steps.push({ step: "guard_immediate", guard, state: preImmediate });
+  const contacts = [];
+  for (let contactIndex = 0; contactIndex < readyItems.length; contactIndex += 1) {
+    const item = readyItems[contactIndex];
+    if (contactIndex > 0) {
+      const returned = await returnToJobsPage(ws);
+      ws = returned.ws;
+      steps.push({ step: "return_to_jobs_for_next_contact", contactIndex, result: returned.result });
+    }
 
-  let immediate = { clicked: false, reason: shouldSend ? guard.reason : "dry_run" };
-  let continueChat = { clicked: false, reason: shouldSend ? "not_started" : "dry_run" };
-  let sendMessage = { sent: false, reason: shouldSend ? "not_started" : "dry_run" };
+    const currentState = await snapshot(ws);
+    if (currentState.flags.sentDialog) {
+      steps.push({
+        step: "dismiss_greet_before_next_contact",
+        contactIndex,
+        result: await dismissGreetDialog(ws),
+      });
+    }
 
-  if (shouldSend && guard.ok) {
-    immediate = await clickImmediate(ws);
-    steps.push({ step: "click_immediate", result: immediate, state: await snapshot(ws) });
-    if (immediate.clicked && immediate.sentDialog && !immediate.captchaOrLogin) {
-      continueChat = await continueToChat(ws, selectedCandidate);
-      let postContinueState = null;
-      if (continueChat.reconnectedAfterNavigation) {
-        try {
-          ws.close();
-        } catch {
-          // The page may have already navigated away from the old inspected target.
+    const restored = await restoreCandidate(ws, item.candidate);
+    steps.push({ step: "restore_batch_candidate", contactIndex, candidate: item.candidate, result: restored });
+    if (!restored.restored) {
+      contacts.push({
+        candidate: item.candidate,
+        job: item.job,
+        match: item.match,
+        guard: { ok: false, reason: restored.reason },
+        immediate: { clicked: false, reason: restored.reason },
+        continueChat: { clicked: false, reason: restored.reason },
+        sendMessage: { sent: false, reason: restored.reason },
+      });
+      continue;
+    }
+
+    const preImmediate = restored.state;
+    const guard = assertCanClickImmediate(item.candidate, preImmediate, item.match.result);
+    steps.push({ step: "guard_immediate", contactIndex, guard, state: preImmediate });
+    let immediate = { clicked: false, reason: shouldSend ? guard.reason : "dry_run" };
+    let continueChat = { clicked: false, reason: shouldSend ? "not_started" : "dry_run" };
+    let sendMessage = { sent: false, reason: shouldSend ? "not_started" : "dry_run" };
+
+    if (shouldSend && guard.ok) {
+      immediate = await clickImmediate(ws);
+      steps.push({ step: "click_immediate", contactIndex, result: immediate, state: await snapshot(ws) });
+      if (immediate.clicked && immediate.sentDialog && !immediate.captchaOrLogin) {
+        continueChat = await continueToChat(ws, item.candidate);
+        let postContinueState = null;
+        if (continueChat.reconnectedAfterNavigation) {
+          try {
+            ws.close();
+          } catch {
+            // The page may have already navigated away from the old inspected target.
+          }
+          const jobId = (item.candidate.href || "").match(/job_detail\/([^.?/]+)/)?.[1] || "";
+          const chatTarget = await pageTarget("chat", 10000, jobId);
+          ws = await connect(chatTarget.webSocketDebuggerUrl);
         }
-        const jobId = (selectedCandidate.href || "").match(/job_detail\/([^.?/]+)/)?.[1] || "";
-        const chatTarget = await pageTarget("chat", 10000, jobId);
-        ws = await connect(chatTarget.webSocketDebuggerUrl);
-      }
-      try {
-        postContinueState = await snapshot(ws);
-      } catch (error) {
-        postContinueState = { error: String(error.message || error) };
-      }
-      steps.push({ step: "continue_to_chat", result: continueChat, state: postContinueState });
-      if (continueChat.clicked && !continueChat.captchaOrLogin) {
-        sendMessage = await sendChatMessage(ws, selectedMatch.result.message, selectedCandidate);
-        let postSendState = null;
         try {
-          postSendState = await snapshot(ws);
+          postContinueState = await snapshot(ws);
         } catch (error) {
-          postSendState = { error: String(error.message || error) };
+          postContinueState = { error: String(error.message || error) };
         }
-        steps.push({ step: "send_chat_message", result: sendMessage, state: postSendState });
+        steps.push({ step: "continue_to_chat", contactIndex, result: continueChat, state: postContinueState });
+        if (continueChat.clicked && !continueChat.captchaOrLogin) {
+          sendMessage = await sendChatMessage(ws, item.match.result.message, item.candidate);
+          let postSendState = null;
+          try {
+            postSendState = await snapshot(ws);
+          } catch (error) {
+            postSendState = { error: String(error.message || error) };
+          }
+          steps.push({ step: "send_chat_message", contactIndex, result: sendMessage, state: postSendState });
+        }
       }
     }
+
+    contacts.push({
+      candidate: item.candidate,
+      job: item.job,
+      match: item.match,
+      detailMatches: restored.restored,
+      guard,
+      immediate,
+      continueChat,
+      sendMessage,
+    });
   }
 
   try {
@@ -885,20 +1115,28 @@ async function main() {
   }
   const afterTarget = await pageTarget();
   const safe = afterTarget.url.includes("zhipin.com") && afterTarget.url !== "https://www.zhipin.com/" && !afterTarget.url.includes("/web/user");
+  const contactedCount = contacts.filter((item) => item.immediate.clicked && (item.immediate.sentDialog || item.sendMessage.sent)).length;
+  const successCount = contacts.filter((item) => item.sendMessage.sent).length;
+  const firstContact = contacts[0];
   const payload = {
     runId,
     safe,
     beforeTarget,
     afterTarget,
-    candidate: selectedCandidate,
-    detailMatches: selectedState.detailTitle.includes(selectedCandidate.title),
-    job: selectedJob,
-    match: selectedMatch,
+    batchSize,
+    batchMatches,
+    contactedCount,
+    successCount,
+    contacts,
+    candidate: firstContact?.candidate || selectedCandidate,
+    detailMatches: firstContact?.detailMatches || false,
+    job: firstContact?.job || selectedJob,
+    match: firstContact?.match || selectedMatch,
     candidateAttempts,
-    guard,
-    immediate,
-    continueChat,
-    sendMessage,
+    guard: firstContact?.guard || { ok: false, reason: "no_contact_result" },
+    immediate: firstContact?.immediate || { clicked: false, reason: "no_contact_result" },
+    continueChat: firstContact?.continueChat || { clicked: false, reason: "no_contact_result" },
+    sendMessage: firstContact?.sendMessage || { sent: false, reason: "no_contact_result" },
     steps,
   };
   const logPath = path.join(logDir, `${runId}-match-communicate-send.json`);
@@ -908,31 +1146,46 @@ async function main() {
   console.log(JSON.stringify({
     logPath,
     safe,
+    batchSize,
+    batchCount: batchMatches.length,
+    contactedCount,
+    successCount,
+    contacts: contacts.map((item) => ({
+      candidate: {
+        title: item.candidate.title,
+        href: item.candidate.href,
+      },
+      match: item.match.result,
+      guard: item.guard,
+      immediate: item.immediate,
+      continueChat: item.continueChat,
+      sendMessage: item.sendMessage,
+    })),
     candidate: {
-      index: selectedCandidate.index,
-      title: selectedCandidate.title,
-      city: selectedCandidate.city,
-      minK: selectedCandidate.minK,
-      maxK: selectedCandidate.maxK,
-      keywordScore: selectedCandidate.keywordScore,
+      index: firstContact?.candidate.index ?? selectedCandidate.index,
+      title: firstContact?.candidate.title || selectedCandidate.title,
+      city: firstContact?.candidate.city || selectedCandidate.city,
+      minK: firstContact?.candidate.minK ?? selectedCandidate.minK,
+      maxK: firstContact?.candidate.maxK ?? selectedCandidate.maxK,
+      keywordScore: firstContact?.candidate.keywordScore ?? selectedCandidate.keywordScore,
     },
-    match: selectedMatch.result,
+    match: firstContact?.match.result || selectedMatch.result,
     attempts: candidateAttempts.map((item) => ({
       index: item.candidate?.index,
       title: item.candidate?.title,
       matched: item.match?.result?.matched ?? false,
       reason: item.match?.result?.reason || item.reason || "",
     })),
-    guard,
-    immediate,
+    guard: firstContact?.guard,
+    immediate: firstContact?.immediate,
     continueChat: {
-      clicked: continueChat.clicked,
-      reason: continueChat.reason,
-      href: continueChat.href,
-      title: continueChat.title,
-      inputs: continueChat.inputs,
+      clicked: firstContact?.continueChat.clicked,
+      reason: firstContact?.continueChat.reason,
+      href: firstContact?.continueChat.href,
+      title: firstContact?.continueChat.title,
+      inputs: firstContact?.continueChat.inputs,
     },
-    sendMessage,
+    sendMessage: firstContact?.sendMessage,
     afterTarget: { url: afterTarget.url, title: afterTarget.title },
   }, null, 2));
 }

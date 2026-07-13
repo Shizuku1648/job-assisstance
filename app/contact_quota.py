@@ -9,6 +9,10 @@ from app.database import Database
 BOSS_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
+def contact_batch_size(remaining_target: int, quota_remaining: int, maximum: int = 10) -> int:
+    return max(min(remaining_target, quota_remaining, maximum), 0)
+
+
 def utc_text(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 

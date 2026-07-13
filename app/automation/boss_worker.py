@@ -10,7 +10,7 @@ from typing import Any
 from app.automation.artifacts import append_markdown, ensure_file, local_now_slug
 from app.automation.edge import cdp_port_is_open, launch_edge_for_cdp, open_edge_url, wait_for_cdp
 from app.config import ROOT_DIR, Settings
-from app.contact_quota import BOSS_TIMEZONE, get_contact_quota, utc_text
+from app.contact_quota import BOSS_TIMEZONE, contact_batch_size, get_contact_quota, utc_text
 from app.database import Database
 from app.models import WorkerStatus
 
@@ -202,35 +202,45 @@ class BossWorker:
         quota_exhausted = False
 
         try:
-            for index in range(limit):
+            while sum(int(item.get("contacted_count", 0)) for item in results) < limit:
                 if self._stop_event.is_set():
                     break
-                iteration_contacted = False
+                batch_contacted = False
                 for attempt in range(1, max_attempts_per_iteration + 1):
                     quota = get_contact_quota(self.db, self.settings.daily_contact_limit)
-                    if quota["remaining"] <= 0:
+                    contacted_so_far = sum(int(item.get("contacted_count", 0)) for item in results)
+                    batch_size = contact_batch_size(limit - contacted_so_far, quota["remaining"])
+                    if batch_size <= 0:
                         quota_exhausted = True
                         break
                     self._status = WorkerStatus(
                         True,
                         "contact_loop",
-                        f"正在沟通第 {index + 1}/{limit} 位 Boss（尝试 {attempt}/{max_attempts_per_iteration}）",
+                        (
+                            f"正在准备第 {contacted_so_far + 1}/{limit} 位 Boss"
+                            f"（并发批次 {batch_size}，尝试 {attempt}/{max_attempts_per_iteration}）"
+                        ),
                     )
-                    result = await asyncio.to_thread(self._run_contact_once, run_id, index + 1)
+                    result = await asyncio.to_thread(
+                        self._run_contact_once,
+                        run_id,
+                        contacted_so_far + 1,
+                        batch_size,
+                    )
                     result["attempt"] = attempt
                     results.append(result)
-                    if result.get("contacted"):
-                        iteration_contacted = True
+                    if int(result.get("contacted_count", 0)) > 0:
+                        batch_contacted = True
                         break
                     if self._stop_event.is_set():
                         break
                     await asyncio.sleep(2)
-                if not iteration_contacted:
+                if not batch_contacted:
                     break
                 await asyncio.sleep(1.5)
 
-            contacted_count = sum(1 for item in results if item.get("contacted"))
-            success_count = sum(1 for item in results if item.get("success"))
+            contacted_count = sum(int(item.get("contacted_count", 0)) for item in results)
+            success_count = sum(int(item.get("success_count", 0)) for item in results)
             payload = {
                 "run_id": run_id,
                 "limit": limit,
@@ -279,8 +289,14 @@ class BossWorker:
             )
             self._status = WorkerStatus(False, "error", f"运行失败：{exc}")
 
-    def _run_contact_once(self, run_id: str, iteration: int) -> dict[str, Any]:
-        command = ["node", "scripts\\run_boss_match_communicate_send.mjs", "--send"]
+    def _run_contact_once(self, run_id: str, iteration: int, batch_size: int) -> dict[str, Any]:
+        command = [
+            "node",
+            "scripts\\run_boss_match_communicate_send.mjs",
+            "--send",
+            "--batch-size",
+            str(batch_size),
+        ]
         completed = subprocess.run(
             command,
             cwd=ROOT_DIR,
@@ -295,6 +311,9 @@ class BossWorker:
             "returncode": completed.returncode,
             "success": completed.returncode == 0,
             "contacted": False,
+            "contacted_count": 0,
+            "success_count": 0,
+            "batch_size": batch_size,
             "stdout_tail": completed.stdout[-4000:],
             "stderr_tail": completed.stderr[-4000:],
         }
@@ -302,15 +321,34 @@ class BossWorker:
             try:
                 parsed = json.loads(completed.stdout)
                 result["parsed"] = parsed
-                immediate = parsed.get("immediate", {})
-                job_id = parsed.get("match", {}).get("job_id")
-                contacted = bool(job_id) and bool(immediate.get("clicked")) and bool(
-                    immediate.get("sentDialog") or parsed.get("sendMessage", {}).get("sent")
-                )
-                result["contacted"] = contacted
-                result["success"] = bool(parsed.get("safe")) and bool(parsed.get("sendMessage", {}).get("sent"))
-                if contacted:
-                    self.db.mark_job_contacted(int(job_id))
+                contacts = parsed.get("contacts")
+                if not isinstance(contacts, list):
+                    contacts = [
+                        {
+                            "match": parsed.get("match", {}),
+                            "immediate": parsed.get("immediate", {}),
+                            "sendMessage": parsed.get("sendMessage", {}),
+                        }
+                    ]
+                contacted_job_ids: list[int] = []
+                sent_count = 0
+                for contact in contacts:
+                    immediate = contact.get("immediate", {})
+                    send_message = contact.get("sendMessage", {})
+                    job_id = contact.get("match", {}).get("job_id")
+                    contacted = bool(job_id) and bool(immediate.get("clicked")) and bool(
+                        immediate.get("sentDialog") or send_message.get("sent")
+                    )
+                    if contacted:
+                        contacted_job_ids.append(int(job_id))
+                    if send_message.get("sent"):
+                        sent_count += 1
+                result["contacted_count"] = len(contacted_job_ids)
+                result["success_count"] = sent_count
+                result["contacted"] = bool(contacted_job_ids)
+                result["success"] = bool(parsed.get("safe")) and sent_count == len(contacted_job_ids)
+                for job_id in contacted_job_ids:
+                    self.db.mark_job_contacted(job_id)
             except (json.JSONDecodeError, TypeError, ValueError):
                 result["success"] = False
         return result
@@ -319,19 +357,22 @@ class BossWorker:
         for log_path in self.settings.logs_dir.glob("*-match-communicate-send.json"):
             try:
                 payload = json.loads(log_path.read_text(encoding="utf-8"))
-                immediate = payload.get("immediate", {})
-                contacted = bool(immediate.get("clicked")) and bool(
-                    immediate.get("sentDialog") or payload.get("sendMessage", {}).get("sent")
-                )
-                job_id = payload.get("match", {}).get("result", {}).get("job_id")
-                if not contacted or not job_id:
-                    continue
                 run_id = str(payload.get("runId", ""))
                 try:
                     local_time = datetime.strptime(run_id, "%Y%m%d-%H%M%S").replace(tzinfo=BOSS_TIMEZONE)
                 except ValueError:
                     local_time = datetime.fromtimestamp(log_path.stat().st_mtime, tz=BOSS_TIMEZONE)
-                self.db.mark_job_contacted(int(job_id), contacted_at=utc_text(local_time))
+                contacts = payload.get("contacts")
+                records = contacts if isinstance(contacts, list) else [payload]
+                for record in records:
+                    immediate = record.get("immediate", {})
+                    contacted = bool(immediate.get("clicked")) and bool(
+                        immediate.get("sentDialog") or record.get("sendMessage", {}).get("sent")
+                    )
+                    match = record.get("match", {})
+                    job_id = match.get("result", {}).get("job_id") or match.get("job_id")
+                    if contacted and job_id:
+                        self.db.mark_job_contacted(int(job_id), contacted_at=utc_text(local_time))
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 continue
 

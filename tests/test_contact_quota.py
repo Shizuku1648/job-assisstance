@@ -7,8 +7,11 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from app.contact_quota import BOSS_TIMEZONE, get_contact_quota, local_day_utc_bounds
+from app.automation.boss_worker import BossWorker
+from app.contact_quota import BOSS_TIMEZONE, contact_batch_size, get_contact_quota, local_day_utc_bounds
 from app.database import Database
 
 
@@ -61,6 +64,47 @@ class ContactQuotaTest(unittest.TestCase):
         profile = Database(migration_path).get_profile()
         self.assertEqual(profile.expected_salary_min_k, 20)
         self.assertEqual(profile.expected_salary_max_k, 25)
+
+    def test_contact_batch_size_tracks_remaining_target_and_quota(self) -> None:
+        self.assertEqual(contact_batch_size(100, 112), 10)
+        self.assertEqual(contact_batch_size(5, 112), 5)
+        self.assertEqual(contact_batch_size(8, 3), 3)
+        self.assertEqual(contact_batch_size(0, 20), 0)
+
+    def test_worker_counts_and_records_multiple_contacts_from_one_batch(self) -> None:
+        first_job_id = self.db.create_job({"title": "first", "status": "matched"})
+        second_job_id = self.db.create_job({"title": "second", "status": "matched"})
+        logs_dir = Path(self.temp_dir.name) / "logs"
+        logs_dir.mkdir()
+        worker = BossWorker(SimpleNamespace(logs_dir=logs_dir), self.db)
+        stdout = json.dumps(
+            {
+                "safe": True,
+                "contacts": [
+                    {
+                        "match": {"job_id": first_job_id},
+                        "immediate": {"clicked": True, "sentDialog": True},
+                        "sendMessage": {"sent": True},
+                    },
+                    {
+                        "match": {"job_id": second_job_id},
+                        "immediate": {"clicked": True, "sentDialog": True},
+                        "sendMessage": {"sent": True},
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        )
+        completed = SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+        with patch("app.automation.boss_worker.subprocess.run", return_value=completed):
+            result = worker._run_contact_once("test", 1, 2)
+
+        self.assertEqual(result["contacted_count"], 2)
+        self.assertEqual(result["success_count"], 2)
+        self.assertTrue(result["success"])
+        quota = get_contact_quota(self.db, 150)
+        self.assertEqual(quota["contacted_today"], 2)
 
 
 if __name__ == "__main__":
