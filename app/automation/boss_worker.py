@@ -200,15 +200,23 @@ class BossWorker:
         results: list[dict[str, Any]] = []
         max_attempts_per_iteration = 3
         quota_exhausted = False
+        starting_contacted_today = get_contact_quota(
+            self.db,
+            self.settings.daily_contact_limit,
+        )["contacted_today"]
+
+        def contacted_during_run() -> int:
+            current = get_contact_quota(self.db, self.settings.daily_contact_limit)["contacted_today"]
+            return max(int(current) - int(starting_contacted_today), 0)
 
         try:
-            while sum(int(item.get("contacted_count", 0)) for item in results) < limit:
+            while contacted_during_run() < limit:
                 if self._stop_event.is_set():
                     break
                 batch_contacted = False
                 for attempt in range(1, max_attempts_per_iteration + 1):
                     quota = get_contact_quota(self.db, self.settings.daily_contact_limit)
-                    contacted_so_far = sum(int(item.get("contacted_count", 0)) for item in results)
+                    contacted_so_far = contacted_during_run()
                     batch_size = contact_batch_size(limit - contacted_so_far, quota["remaining"])
                     if batch_size <= 0:
                         quota_exhausted = True
@@ -229,7 +237,9 @@ class BossWorker:
                     )
                     result["attempt"] = attempt
                     results.append(result)
-                    if int(result.get("contacted_count", 0)) > 0:
+                    actual_contacted = contacted_during_run()
+                    result["actual_contacted_during_run"] = actual_contacted
+                    if actual_contacted > contacted_so_far:
                         batch_contacted = True
                         break
                     if self._stop_event.is_set():
@@ -239,7 +249,7 @@ class BossWorker:
                     break
                 await asyncio.sleep(1.5)
 
-            contacted_count = sum(int(item.get("contacted_count", 0)) for item in results)
+            contacted_count = contacted_during_run()
             success_count = sum(int(item.get("success_count", 0)) for item in results)
             payload = {
                 "run_id": run_id,
@@ -297,15 +307,31 @@ class BossWorker:
             "--batch-size",
             str(batch_size),
         ]
-        completed = subprocess.run(
-            command,
-            cwd=ROOT_DIR,
-            text=True,
-            encoding="utf-8",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=300,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=ROOT_DIR,
+                text=True,
+                encoding="utf-8",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=900,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            return {
+                "iteration": iteration,
+                "returncode": -1,
+                "success": False,
+                "contacted": False,
+                "contacted_count": 0,
+                "success_count": 0,
+                "batch_size": batch_size,
+                "stdout_tail": stdout[-4000:],
+                "stderr_tail": stderr[-4000:],
+                "error": f"Node batch timed out after {exc.timeout} seconds",
+            }
         result: dict[str, Any] = {
             "iteration": iteration,
             "returncode": completed.returncode,
@@ -337,7 +363,9 @@ class BossWorker:
                     send_message = contact.get("sendMessage", {})
                     job_id = contact.get("match", {}).get("job_id")
                     contacted = bool(job_id) and bool(immediate.get("clicked")) and bool(
-                        immediate.get("sentDialog") or send_message.get("sent")
+                        immediate.get("sentDialog")
+                        or immediate.get("continueAvailable")
+                        or send_message.get("sent")
                     )
                     if contacted:
                         contacted_job_ids.append(int(job_id))
@@ -367,7 +395,9 @@ class BossWorker:
                 for record in records:
                     immediate = record.get("immediate", {})
                     contacted = bool(immediate.get("clicked")) and bool(
-                        immediate.get("sentDialog") or record.get("sendMessage", {}).get("sent")
+                        immediate.get("sentDialog")
+                        or immediate.get("continueAvailable")
+                        or record.get("sendMessage", {}).get("sent")
                     )
                     match = record.get("match", {})
                     job_id = match.get("result", {}).get("job_id") or match.get("job_id")

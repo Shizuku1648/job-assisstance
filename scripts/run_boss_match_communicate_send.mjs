@@ -42,8 +42,12 @@ async function fetchJson(url) {
 }
 
 async function pageTarget(prefer = "jobs", timeoutMs = 0, urlMarker = "") {
-  const preferredPath = prefer === "chat" ? "/web/geek/chat" : "/web/geek/jobs";
-  const fallbackPath = prefer === "chat" ? "/web/geek/jobs" : "/web/geek/chat";
+  const preferredPaths = prefer === "chat"
+    ? ["/web/geek/chat"]
+    : ["/web/geek/jobs", "/job_detail/"];
+  const fallbackPaths = prefer === "chat"
+    ? ["/web/geek/jobs", "/job_detail/"]
+    : ["/web/geek/chat"];
   const deadline = Date.now() + timeoutMs;
 
   do {
@@ -52,11 +56,20 @@ async function pageTarget(prefer = "jobs", timeoutMs = 0, urlMarker = "") {
       const usablePages = targets.filter((target) =>
         target.type === "page" &&
         target.url.includes("zhipin.com") &&
-        (target.url.includes("/web/geek/jobs") || target.url.includes("/web/geek/chat"))
+        (
+          target.url.includes("/web/geek/jobs") ||
+          target.url.includes("/web/geek/chat") ||
+          target.url.includes("/job_detail/")
+        )
       );
       const page =
-        usablePages.find((target) => target.url.includes(preferredPath) && (!urlMarker || target.url.includes(urlMarker))) ||
-        (!urlMarker ? usablePages.find((target) => target.url.includes(fallbackPath)) : null);
+        usablePages.find((target) =>
+          preferredPaths.some((pathPart) => target.url.includes(pathPart)) &&
+          (!urlMarker || target.url.includes(urlMarker))
+        ) ||
+        (!urlMarker
+          ? usablePages.find((target) => fallbackPaths.some((pathPart) => target.url.includes(pathPart)))
+          : null);
       if (page) return page;
     } catch (error) {
       if (Date.now() >= deadline) throw error;
@@ -71,6 +84,7 @@ function isBossAutomationPage(target) {
   if (target.type !== "page" || !target.url.includes("zhipin.com")) return false;
   return target.url.includes("/web/geek/jobs") ||
     target.url.includes("/web/geek/chat") ||
+    target.url.includes("/job_detail/") ||
     target.url.includes("/web/user") ||
     target.url === "https://www.zhipin.com/";
 }
@@ -404,25 +418,15 @@ async function returnToJobsPage(ws) {
 }
 
 async function restoreCandidate(ws, candidate) {
-  const maxScrolls = 20;
-  let reloads = 0;
-  for (let round = 0; round <= maxScrolls; round += 1) {
-    const clickResult = await clickJobHref(ws, candidate.href);
-    if (clickResult.clicked) {
-      const state = await snapshot(ws);
-      const restored = state.detailTitle.includes(candidate.title) && state.activeCardHref === candidate.href;
-      if (restored) return { restored: true, round, clickResult, state };
-    }
-    if (round === maxScrolls) break;
-    const scrollResult = await scrollJobList(ws);
-    if (!scrollResult.newUrls.length && reloads < 1 && round >= 2) {
-      reloads += 1;
-      await sendCdp(ws, "Page.reload");
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-    }
+  const clickResult = await clickJobHref(ws, candidate.href);
+  if (clickResult.clicked) {
+    const state = await snapshot(ws);
+    const restored = state.detailTitle.includes(candidate.title) && state.activeCardHref === candidate.href;
+    if (restored) return { restored: true, directNavigation: false, clickResult, state };
   }
   try {
-    await sendCdp(ws, "Page.navigate", { url: candidate.href });
+    const directHref = candidate.directHref || candidate.href;
+    await sendCdp(ws, "Page.navigate", { url: directHref });
     const deadline = Date.now() + 15000;
     do {
       try {
@@ -432,7 +436,7 @@ async function restoreCandidate(ws, candidate) {
           return {
             restored: true,
             directNavigation: true,
-            round: maxScrolls + 1,
+            clickResult,
             state,
           };
         }
@@ -445,11 +449,71 @@ async function restoreCandidate(ws, candidate) {
     return {
       restored: false,
       reason: "candidate_direct_navigation_failed",
-      href: candidate.href,
+      href: candidate.directHref || candidate.href,
       error: String(error.message || error),
     };
   }
-  return { restored: false, reason: "candidate_url_not_found_after_scroll_or_direct_navigation", href: candidate.href };
+  return {
+    restored: false,
+    reason: "candidate_url_not_found_in_dom_or_direct_navigation",
+    href: candidate.directHref || candidate.href,
+  };
+}
+
+async function openCandidateTab(ws, candidate) {
+  const directHref = candidate.directHref || candidate.href;
+  const created = await sendCdp(ws, "Target.createTarget", { url: directHref, background: true });
+  const deadline = Date.now() + 15000;
+  let target = null;
+  do {
+    const targets = await fetchJson(`${cdpUrl.replace(/\/$/, "")}/json`);
+    target = targets.find((item) => item.id === created.targetId) || null;
+    if (target?.webSocketDebuggerUrl) break;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  } while (Date.now() < deadline);
+  if (!target?.webSocketDebuggerUrl) {
+    return { ready: false, targetId: created.targetId, reason: "candidate_tab_target_not_found" };
+  }
+
+  const tabWs = await connect(target.webSocketDebuggerUrl);
+  let state = null;
+  do {
+    try {
+      state = await snapshot(tabWs);
+      const hasImmediate =
+        state.buttons.some((button) => button.text === "立即沟通") ||
+        state.bodyText.includes("立即沟通");
+      const expectedPath = new URL(candidate.href).pathname;
+      const currentPath = new URL(state.page.href).pathname;
+      if (currentPath === expectedPath && hasImmediate) {
+        return { ready: true, targetId: created.targetId, ws: tabWs, state, url: state.page.href };
+      }
+    } catch {
+      // The new tab replaces its execution context while loading the detail page.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  } while (Date.now() < deadline);
+
+  try {
+    tabWs.close();
+  } catch {
+    // Ignore close errors for a failed tab.
+  }
+  return {
+    ready: false,
+    targetId: created.targetId,
+    reason: "candidate_tab_detail_not_ready",
+    url: state?.page?.href || target.url,
+  };
+}
+
+async function closeBossTarget(targetId) {
+  if (!targetId) return;
+  try {
+    await fetch(`${cdpUrl.replace(/\/$/, "")}/json/close/${encodeURIComponent(targetId)}`, { method: "PUT" });
+  } catch {
+    // Target cleanup is best effort; the next run also removes duplicates.
+  }
 }
 
 function selectCandidate(jobs) {
@@ -585,6 +649,9 @@ JSON.stringify((() => {
     textOf(detailRoot.querySelector('.job-sec-text')) ||
     textOf(detailRoot.querySelector('.job-detail-section')) ||
     textOf(detailRoot);
+  const directUrl = Array.from(detailRoot.querySelectorAll('a[href*="/job_detail/"]'))
+    .map((link) => link.href || '')
+    .find((href) => href.includes('securityId=')) || ${JSON.stringify(candidate.href)};
   return {
     title,
     company,
@@ -592,6 +659,7 @@ JSON.stringify((() => {
     city,
     jd,
     url: ${JSON.stringify(candidate.href)},
+    directUrl,
     pageHref: location.href,
     pageTitle: document.title,
   };
@@ -615,10 +683,29 @@ function matchJobsWithPython(runId, batchIndex, jobs) {
   return { snapshotPath, result: JSON.parse(result.stdout) };
 }
 
+function markJobContactedWithPython(jobId) {
+  const python = path.join(root, ".venv", "Scripts", "python.exe");
+  const result = spawnSync(python, ["scripts/mark_job_contacted.py", String(jobId)], {
+    cwd: root,
+    encoding: "utf8",
+    env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+    timeout: 30000,
+  });
+  if (result.status !== 0) {
+    throw new Error(`mark_job_contacted.py failed: ${result.stderr || result.stdout}`);
+  }
+  return { recorded: true, jobId };
+}
+
 function assertCanClickImmediate(candidate, state, matchResult) {
-  const immediate = state.buttons.find((button) => button.text === "立即沟通");
+  const immediate =
+    state.buttons.find((button) => button.text === "立即沟通") ||
+    (state.bodyText.includes("立即沟通") ? { className: "" } : null);
   if (!matchResult?.matched) return { ok: false, reason: "AI 匹配结果不是 true" };
-  if (!candidate?.title || !state.detailTitle.includes(candidate.title)) {
+  const candidatePath = (() => { try { return new URL(candidate?.href || "").pathname; } catch { return ""; } })();
+  const pagePath = (() => { try { return new URL(state.page?.href || "").pathname; } catch { return ""; } })();
+  const sameJob = Boolean(candidatePath) && candidatePath === pagePath;
+  if (!sameJob && (!candidate?.title || !state.detailTitle.includes(candidate.title))) {
     return { ok: false, reason: `详情岗位未切换到候选岗位：candidate=${candidate?.title || ""}, detailTitle=${state.detailTitle}` };
   }
   if (!immediate) return { ok: false, reason: "未找到立即沟通按钮" };
@@ -632,8 +719,10 @@ async function clickImmediate(ws) {
   return await evalJson(ws, String.raw`
 new Promise((resolve) => {
   const clean = (value) => (value || '').toString().replace(/\s+/g, ' ').trim();
-  const detailRoot = document.querySelector('.job-detail-container') || document.querySelector('.job-detail') || document;
-  const button = Array.from(detailRoot.querySelectorAll('a, button')).find((el) => clean(el.innerText || el.textContent) === '立即沟通');
+  const visible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+  const button = Array.from(document.querySelectorAll('a, button')).find((el) =>
+    visible(el) && clean(el.innerText || el.textContent) === '立即沟通'
+  );
   if (!button) return resolve(JSON.stringify({ clicked: false, reason: 'not_found' }));
   if ((button.className || '').toString().includes('is-disabled')) return resolve(JSON.stringify({ clicked: false, reason: 'disabled', className: button.className.toString() }));
   button.scrollIntoView({ block: 'center' });
@@ -646,6 +735,9 @@ new Promise((resolve) => {
         href: location.href,
         title: document.title,
         sentDialog: !!dialog && (document.body?.innerText || '').includes('已向BOSS发送消息'),
+        continueAvailable: Array.from(document.querySelectorAll('a, button')).some((el) =>
+          visible(el) && clean(el.innerText || el.textContent) === '继续沟通'
+        ),
         dialogText: clean(dialog?.innerText).slice(0, 1000),
         buttons: Array.from((dialog || document).querySelectorAll('a, button')).map((el, index) => ({
           index,
@@ -666,8 +758,13 @@ async function continueToChat(ws, candidate) {
     return await evalJson(ws, String.raw`
 new Promise((resolve) => {
   const clean = (value) => (value || '').toString().replace(/\s+/g, ' ').trim();
+  const visible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
   const dialog = document.querySelector('.greet-boss-dialog');
-  const button = dialog ? Array.from(dialog.querySelectorAll('a, button')).find((el) => clean(el.innerText || el.textContent) === '继续沟通') : null;
+  const button = dialog
+    ? Array.from(dialog.querySelectorAll('a, button')).find((el) => clean(el.innerText || el.textContent) === '继续沟通')
+    : Array.from(document.querySelectorAll('a, button')).find((el) =>
+        visible(el) && clean(el.innerText || el.textContent) === '继续沟通'
+      );
   if (!button) return resolve(JSON.stringify({ clicked: false, reason: 'not_found' }));
   button.click();
   setTimeout(() => {
@@ -930,6 +1027,7 @@ async function main() {
       }
 
       const job = await extractDetailJob(ws, candidate);
+      candidate.directHref = job.directUrl || candidate.href;
       const attempt = { round, candidate, detailMatches, job, match: null };
       candidateAttempts.push(attempt);
       pendingBatch.push(attempt);
@@ -1024,87 +1122,100 @@ async function main() {
   const contacts = [];
   for (let contactIndex = 0; contactIndex < readyItems.length; contactIndex += 1) {
     const item = readyItems[contactIndex];
-    if (contactIndex > 0) {
-      const returned = await returnToJobsPage(ws);
-      ws = returned.ws;
-      steps.push({ step: "return_to_jobs_for_next_contact", contactIndex, result: returned.result });
-    }
-
-    const currentState = await snapshot(ws);
-    if (currentState.flags.sentDialog) {
-      steps.push({
-        step: "dismiss_greet_before_next_contact",
-        contactIndex,
-        result: await dismissGreetDialog(ws),
-      });
-    }
-
-    const restored = await restoreCandidate(ws, item.candidate);
-    steps.push({ step: "restore_batch_candidate", contactIndex, candidate: item.candidate, result: restored });
-    if (!restored.restored) {
+    const opened = await openCandidateTab(ws, item.candidate);
+    const { ws: _openedWs, ...openedLog } = opened;
+    steps.push({ step: "open_batch_candidate_tab", contactIndex, candidate: item.candidate, result: openedLog });
+    if (!opened.ready) {
+      await closeBossTarget(opened.targetId);
       contacts.push({
         candidate: item.candidate,
         job: item.job,
         match: item.match,
-        guard: { ok: false, reason: restored.reason },
-        immediate: { clicked: false, reason: restored.reason },
-        continueChat: { clicked: false, reason: restored.reason },
-        sendMessage: { sent: false, reason: restored.reason },
+        guard: { ok: false, reason: opened.reason },
+        immediate: { clicked: false, reason: opened.reason },
+        continueChat: { clicked: false, reason: opened.reason },
+        sendMessage: { sent: false, reason: opened.reason },
       });
       continue;
     }
 
-    const preImmediate = restored.state;
+    let contactWs = opened.ws;
+    let activeTargetId = opened.targetId;
+    const preImmediate = opened.state;
     const guard = assertCanClickImmediate(item.candidate, preImmediate, item.match.result);
     steps.push({ step: "guard_immediate", contactIndex, guard, state: preImmediate });
     let immediate = { clicked: false, reason: shouldSend ? guard.reason : "dry_run" };
     let continueChat = { clicked: false, reason: shouldSend ? "not_started" : "dry_run" };
     let sendMessage = { sent: false, reason: shouldSend ? "not_started" : "dry_run" };
+    let contactRecord = { recorded: false, reason: shouldSend ? "not_contacted" : "dry_run" };
+    let contactError = "";
 
-    if (shouldSend && guard.ok) {
-      immediate = await clickImmediate(ws);
-      steps.push({ step: "click_immediate", contactIndex, result: immediate, state: await snapshot(ws) });
-      if (immediate.clicked && immediate.sentDialog && !immediate.captchaOrLogin) {
-        continueChat = await continueToChat(ws, item.candidate);
-        let postContinueState = null;
-        if (continueChat.reconnectedAfterNavigation) {
-          try {
-            ws.close();
-          } catch {
-            // The page may have already navigated away from the old inspected target.
+    try {
+      if (shouldSend && guard.ok) {
+        immediate = await clickImmediate(contactWs);
+        steps.push({ step: "click_immediate", contactIndex, result: immediate, state: await snapshot(contactWs) });
+        if (
+          immediate.clicked &&
+          (immediate.sentDialog || immediate.continueAvailable) &&
+          !immediate.captchaOrLogin
+        ) {
+          contactRecord = markJobContactedWithPython(item.match.result.job_id);
+          steps.push({ step: "record_contact", contactIndex, result: contactRecord });
+          continueChat = await continueToChat(contactWs, item.candidate);
+          let postContinueState = null;
+          if (continueChat.reconnectedAfterNavigation) {
+            try {
+              contactWs.close();
+            } catch {
+              // The detail tab may have already navigated away.
+            }
+            const jobId = (item.candidate.href || "").match(/job_detail\/([^.?/]+)/)?.[1] || "";
+            const chatTarget = await pageTarget("chat", 10000, jobId);
+            activeTargetId = chatTarget.id;
+            contactWs = await connect(chatTarget.webSocketDebuggerUrl);
           }
-          const jobId = (item.candidate.href || "").match(/job_detail\/([^.?/]+)/)?.[1] || "";
-          const chatTarget = await pageTarget("chat", 10000, jobId);
-          ws = await connect(chatTarget.webSocketDebuggerUrl);
-        }
-        try {
-          postContinueState = await snapshot(ws);
-        } catch (error) {
-          postContinueState = { error: String(error.message || error) };
-        }
-        steps.push({ step: "continue_to_chat", contactIndex, result: continueChat, state: postContinueState });
-        if (continueChat.clicked && !continueChat.captchaOrLogin) {
-          sendMessage = await sendChatMessage(ws, item.match.result.message, item.candidate);
-          let postSendState = null;
           try {
-            postSendState = await snapshot(ws);
+            postContinueState = await snapshot(contactWs);
           } catch (error) {
-            postSendState = { error: String(error.message || error) };
+            postContinueState = { error: String(error.message || error) };
           }
-          steps.push({ step: "send_chat_message", contactIndex, result: sendMessage, state: postSendState });
+          steps.push({ step: "continue_to_chat", contactIndex, result: continueChat, state: postContinueState });
+          if (continueChat.clicked && !continueChat.captchaOrLogin) {
+            sendMessage = await sendChatMessage(contactWs, item.match.result.message, item.candidate);
+            let postSendState = null;
+            try {
+              postSendState = await snapshot(contactWs);
+            } catch (error) {
+              postSendState = { error: String(error.message || error) };
+            }
+            steps.push({ step: "send_chat_message", contactIndex, result: sendMessage, state: postSendState });
+          }
         }
       }
+    } catch (error) {
+      contactError = String(error.message || error);
+      steps.push({ step: "contact_batch_candidate_error", contactIndex, error: contactError });
+    } finally {
+      try {
+        contactWs.close();
+      } catch {
+        // Ignore close errors after navigation.
+      }
+      await closeBossTarget(activeTargetId);
+      if (activeTargetId !== opened.targetId) await closeBossTarget(opened.targetId);
     }
 
     contacts.push({
       candidate: item.candidate,
       job: item.job,
       match: item.match,
-      detailMatches: restored.restored,
+      detailMatches: opened.ready,
       guard,
       immediate,
+      contactRecord,
       continueChat,
       sendMessage,
+      error: contactError,
     });
   }
 
@@ -1115,7 +1226,10 @@ async function main() {
   }
   const afterTarget = await pageTarget();
   const safe = afterTarget.url.includes("zhipin.com") && afterTarget.url !== "https://www.zhipin.com/" && !afterTarget.url.includes("/web/user");
-  const contactedCount = contacts.filter((item) => item.immediate.clicked && (item.immediate.sentDialog || item.sendMessage.sent)).length;
+  const contactedCount = contacts.filter((item) =>
+    item.immediate.clicked &&
+    (item.immediate.sentDialog || item.immediate.continueAvailable || item.sendMessage.sent)
+  ).length;
   const successCount = contacts.filter((item) => item.sendMessage.sent).length;
   const firstContact = contacts[0];
   const payload = {
@@ -1158,6 +1272,7 @@ async function main() {
       match: item.match.result,
       guard: item.guard,
       immediate: item.immediate,
+      contactRecord: item.contactRecord,
       continueChat: item.continueChat,
       sendMessage: item.sendMessage,
     })),
