@@ -4,6 +4,7 @@ import { spawnSync, spawn } from "node:child_process";
 
 const root = path.resolve(import.meta.dirname, "..");
 const cdpUrl = process.env.EDGE_CDP_URL || "http://127.0.0.1:9222";
+const apiBaseUrl = process.env.JOB_ASSISTANCE_API_URL || "http://127.0.0.1:8000";
 const logDir = path.join(root, "runtime", "logs");
 const docsDir = path.join(root, "runtime", "reports");
 fs.mkdirSync(logDir, { recursive: true });
@@ -39,6 +40,17 @@ async function fetchJson(url) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`${url} HTTP ${response.status}`);
   return await response.json();
+}
+
+async function loadCandidateCities() {
+  const profile = await fetchJson(`${apiBaseUrl.replace(/\/$/, "")}/api/profile`);
+  const candidateCities = Array.isArray(profile.candidate_cities)
+    ? [...new Set(profile.candidate_cities.map((city) => String(city).trim()).filter(Boolean))]
+    : [];
+  if (!candidateCities.length) {
+    throw new Error("候选城市为空，请先在控制台保存至少一个候选城市");
+  }
+  return candidateCities;
 }
 
 async function pageTarget(prefer = "jobs", timeoutMs = 0, urlMarker = "") {
@@ -298,28 +310,46 @@ async function waitForJobCards(ws, timeoutMs = 15000) {
   return { ready: false, state: state || await snapshot(ws) };
 }
 
-async function ensureShanghaiIntent(ws) {
+async function ensureCandidateIntent(ws, candidateCities) {
   return await evalJson(ws, String.raw`
 new Promise((resolve) => {
   const clean = (value) => (value || '').toString().replace(/\s+/g, ' ').trim();
+  const candidateCities = ${JSON.stringify(candidateCities)};
+  const intentElements = Array.from(document.querySelectorAll('a.expect-item'));
   const before = {
     href: location.href,
     title: document.title,
     activeIntent: clean(document.querySelector('a.expect-item.active')?.innerText),
-    intents: Array.from(document.querySelectorAll('a.expect-item')).map((el, index) => ({
+    intents: intentElements.map((el, index) => ({
       index,
       text: clean(el.innerText || el.textContent),
       active: el.classList.contains('active'),
     })),
   };
-  const shanghai = Array.from(document.querySelectorAll('a.expect-item')).find((el) => clean(el.innerText || el.textContent).includes('上海'));
-  if (!shanghai) return resolve(JSON.stringify({ clicked: false, reason: 'shanghai_intent_not_found', before }));
-  if (shanghai.classList.contains('active')) return resolve(JSON.stringify({ clicked: false, reason: 'already_active', before }));
-  shanghai.click();
+  const activeCity = candidateCities.find((city) => before.activeIntent.includes(city));
+  if (activeCity) {
+    return resolve(JSON.stringify({ clicked: false, reason: 'already_active', selectedCity: activeCity, before }));
+  }
+  const selection = candidateCities
+    .map((city) => ({
+      city,
+      element: intentElements.find((el) => clean(el.innerText || el.textContent).includes(city)),
+    }))
+    .find((item) => item.element);
+  if (!selection) {
+    return resolve(JSON.stringify({
+      clicked: false,
+      reason: 'candidate_intent_not_found',
+      candidateCities,
+      before,
+    }));
+  }
+  selection.element.click();
   setTimeout(() => {
     const locations = Array.from(document.querySelectorAll('.job-card-wrap .company-location')).slice(0, 8).map((el) => clean(el.innerText || el.textContent));
     resolve(JSON.stringify({
       clicked: true,
+      selectedCity: selection.city,
       before,
       after: {
         href: location.href,
@@ -516,7 +546,7 @@ async function closeBossTarget(targetId) {
   }
 }
 
-function selectCandidate(jobs) {
+function selectCandidate(jobs, candidateCities) {
   const scored = jobs.map((job) => {
     const decodedText = decodeBossText(job.text);
     const salaryRange = salaryRangeK(job.text);
@@ -540,7 +570,12 @@ function selectCandidate(jobs) {
     };
   });
   const candidates = scored
-    .filter((job) => job.city.includes("上海") && job.minK !== null && job.maxK !== null && job.keywordScore > 0)
+    .filter((job) =>
+      candidateCities.some((city) => job.city.includes(city)) &&
+      job.minK !== null &&
+      job.maxK !== null &&
+      job.keywordScore > 0
+    )
     .sort((a, b) => b.keywordScore - a.keywordScore || b.minK - a.minK || a.index - b.index);
   return { scored, candidates, candidate: candidates[0] };
 }
@@ -925,16 +960,27 @@ function writeDocs(runId, payload) {
 
 async function main() {
   const runId = stamp();
+  const candidateCities = await loadCandidateCities();
   const beforeTarget = await openJobsPage();
   let ws = await connect(beforeTarget.webSocketDebuggerUrl);
   const steps = [];
 
   const initialReady = await waitForJobCards(ws);
   const before = initialReady.state;
-  steps.push({ step: "before", ready: initialReady.ready, state: before });
-  if (!before.activeIntent.includes("上海") || !before.jobs.some((job) => job.city.includes("上海"))) {
-    const intentResult = await ensureShanghaiIntent(ws);
-    steps.push({ step: "ensure_shanghai_intent", result: intentResult, state: await snapshot(ws) });
+  steps.push({ step: "before", ready: initialReady.ready, candidateCities, state: before });
+  const activeIntentMatches = candidateCities.some((city) => before.activeIntent.includes(city));
+  const visibleJobsMatch = before.jobs.some((job) =>
+    candidateCities.some((city) => job.city.includes(city))
+  );
+  if (!activeIntentMatches || !visibleJobsMatch) {
+    const intentResult = await ensureCandidateIntent(ws, candidateCities);
+    steps.push({ step: "ensure_candidate_intent", result: intentResult, state: await snapshot(ws) });
+    if (intentResult.reason === "candidate_intent_not_found") {
+      throw new Error(
+        `未找到候选城市对应的 Boss 求职意向：${candidateCities.join("、")}；` +
+        `当前意向：${intentResult.before.intents.map((item) => item.text).join(" | ")}`
+      );
+    }
   }
   if (before.flags.sentDialog) {
     steps.push({ step: "dismiss_existing_greet_dialog", result: await dismissGreetDialog(ws) });
@@ -990,7 +1036,7 @@ async function main() {
   };
 
   for (let round = 0; round <= maxScrollRounds && !selectedCandidate; round += 1) {
-    const selection = selectCandidate(stateForSelection.jobs);
+    const selection = selectCandidate(stateForSelection.jobs, candidateCities);
     const visibleUrls = stateForSelection.jobs.map((job) => job.href).filter(Boolean);
     const newVisibleUrls = visibleUrls.filter((href) => !observedUrls.has(href));
     visibleUrls.forEach((href) => observedUrls.add(href));
